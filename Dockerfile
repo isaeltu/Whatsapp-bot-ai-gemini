@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 # Librerias de sistema que necesita Chromium headless para correr (whatsapp-web.js
 # las necesita aunque el Chromium en si lo instale npm/puppeteer). Sin esto,
