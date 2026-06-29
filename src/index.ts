@@ -85,7 +85,16 @@ app.listen(port, () => console.log(`Health check escuchando en puerto ${port}${c
 const whatsappClient = new Client({
   authStrategy: new LocalAuth({ clientId }),
   puppeteer: {
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      // /dev/shm viene limitado a 64MB por defecto en Docker; Chrome se
+      // queda sin espacio ahi justo al inyectar el script de WhatsApp Web y
+      // el contexto de ejecucion se destruye a medio camino. Esto le dice a
+      // Chrome que use /tmp en vez de /dev/shm para memoria compartida.
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
     // En produccion (Docker/Railway) usamos el Chromium del sistema en vez
     // del que descarga Puppeteer, ver Dockerfile. En local, sin esta
     // variable, usa el Chromium que ya descargo Puppeteer por su cuenta.
