@@ -57,6 +57,10 @@ const whatsappClient = new Client({
   authStrategy: new LocalAuth({ clientId }),
   puppeteer: {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    // En produccion (Docker/Railway) usamos el Chromium del sistema en vez
+    // del que descarga Puppeteer, ver Dockerfile. En local, sin esta
+    // variable, usa el Chromium que ya descargo Puppeteer por su cuenta.
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   },
   webVersionCache: {
     type: "remote",

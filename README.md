@@ -34,10 +34,10 @@ Por cada mensaje de texto o nota de voz entrante:
    se fuerza un handoff en vez de seguir insistiendo.
 
 La memoria de conversacion (historial + intentos fallidos + nombre/correo ya
-capturados) vive en un `Map` en RAM (`src/memory.ts`), igual de limitada que
-el `workflowStaticData` que usaba n8n: se pierde si el proceso se reinicia.
-Para esta escala (un restaurante, un proceso) es suficiente; si se necesita
-sobrevivir reinicios habria que mover ese estado a una tabla de Supabase.
+capturados) vive en Redis (Upstash, `src/memory.ts`), asi que sobrevive
+reinicios y redeploys del proceso. `src/rateLimiter.ts` limita cuantos
+mensajes por minuto procesa un mismo numero (evita abuso/costo descontrolado
+de la API de Gemini).
 
 ## 1. Configurar Supabase
 
@@ -100,12 +100,41 @@ En la app: **Configuracion -> seccion "Bot de WhatsApp"**:
    el bot no entendio, que aparecio un registro en "Bot de WhatsApp ->
    Handoffs" del panel admin.
 
+## 6. Desplegar en Railway (recomendado para produccion)
+
+El bot necesita un proceso corriendo 24/7 con disco persistente (para no
+volver a escanear el QR en cada redeploy) -- Railway funciona bien para esto.
+
+1. **Pushear este repo a GitHub** si no esta subido ya (`git push`).
+2. En **railway.app**: New Project -> Deploy from GitHub repo -> elegir este
+   repositorio. Railway detecta el `Dockerfile` automaticamente (ya incluye
+   Chromium y sus dependencias de sistema -- sin esto el bot conecta pero
+   crashea al intentar abrir el navegador).
+3. **Agregar un Volume**: en el servicio -> Settings -> Volumes -> Add Volume,
+   mount path `/app/.wwebjs_auth`. Sin esto, cada redeploy borra la sesion y
+   hay que volver a escanear el QR.
+4. **Variables de entorno** (Settings -> Variables): copiar todas las del
+   `.env` local (`GEMINI_API_KEY`, `GEMINI_MODEL`, `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`,
+   `RATE_LIMIT_MESSAGES_PER_MINUTE`). No hace falta `PORT` (Railway lo asigna
+   solo) ni `PUPPETEER_EXECUTABLE_PATH` (ya viene fijo en el `Dockerfile`).
+5. **Deploy** y abrir la pestaña "Deployments" -> "View Logs": el QR aparece
+   ahi mismo (como en la terminal local). Escanearlo rapido, expira en ~20s
+   y se regenera solo si no llegas a tiempo.
+6. Una vez conectado, copiar el numero que imprime el log
+   (`WhatsApp listo... Numero del bot: ...`) al panel admin de RestoPOS, igual
+   que en local.
+7. Para varios restaurantes: repetir desde el paso 2 creando un **servicio
+   nuevo** por restaurante dentro del mismo proyecto de Railway (cada uno con
+   su propio Volume y su propio `BOT_CLIENT_ID`), reusando las mismas
+   variables de Gemini/Supabase/Upstash.
+
 ## Limitaciones conocidas
 
-- Un proceso = un restaurante = un numero de WhatsApp (ver arriba). Para
-  varios restaurantes habria que correr un proceso por restaurante (cada uno
-  con su propia carpeta `.wwebjs_auth`, su propio número, y resolverlo igual
-  por ese número en `restaurant_bot_settings`).
+- Un proceso = un restaurante = un numero de WhatsApp. Para varios
+  restaurantes, correr este mismo codigo varias veces con un `BOT_CLIENT_ID`
+  y `PORT` distintos por restaurante (namespacea la sesion automaticamente,
+  ver `.env.example`); `GEMINI_API_KEY`/`SUPABASE_*` se mantienen iguales.
 - Se procesan mensajes de texto y notas de voz (Gemini transcribe e
   interpreta el audio en una sola llamada). Imagenes y stickers se ignoran
   (no rompen el flujo, pero tampoco generan respuesta).
