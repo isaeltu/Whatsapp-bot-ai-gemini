@@ -215,7 +215,21 @@ whatsappClient.on("ready", () => {
   console.log('Verifica que ese mismo numero este en RestoPOS -> Configuracion -> "Bot de WhatsApp".');
 });
 
+whatsappClient.on("disconnected", (reason) => {
+  console.error(`[diagnostico] WhatsApp se desconecto. Razon: ${reason}`);
+  phoneNumberId = null;
+});
+
+whatsappClient.on("change_state", (state) => {
+  console.log(`[diagnostico] change_state: ${state}`);
+});
+
+whatsappClient.on("auth_failure", (message) => {
+  console.error(`[diagnostico] auth_failure: ${message}`);
+});
+
 whatsappClient.on("message", async (msg: Message) => {
+  console.log(`[diagnostico] Evento 'message' recibido. from=${msg.from} type=${msg.type} fromMe=${msg.fromMe} paused=${isPaused} connected=${Boolean(phoneNumberId)}`);
   if (msg.fromMe || !phoneNumberId || isPaused) return;
 
   const isText = msg.type === "chat" && Boolean(msg.body?.trim());
