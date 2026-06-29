@@ -52,6 +52,11 @@ const port = Number(process.env.PORT) || 5000;
 const clientId = process.env.BOT_CLIENT_ID || undefined;
 let phoneNumberId: string | null = null;
 let latestQr: string | null = null;
+// Pausa logica: el proceso/la sesion de WhatsApp se quedan conectados (mas
+// rapido de reanudar y evita repetir todo el lanzamiento de Chromium), pero
+// el bot ignora mensajes entrantes mientras esta en true. Es la forma rapida
+// de "apagarlo" sin tocar Railway ni RestoPOS.
+let isPaused = false;
 
 // /qr y /health quedan en una URL publica de Railway -- sin esto, cualquiera
 // que adivine o encuentre esa URL podria ver el estado del bot, o peor,
@@ -80,7 +85,40 @@ const app = express();
 app.use(express.json());
 app.get("/health", (req, res) => {
   if (!requireAdminToken(req, res)) return;
-  res.json({ ok: true, connected: Boolean(phoneNumberId), clientId: clientId ?? "default" });
+  res.json({ ok: true, connected: Boolean(phoneNumberId), paused: isPaused, clientId: clientId ?? "default" });
+});
+
+// Panel simple para pausar/reanudar el bot con un click, sin tocar Railway
+// ni RestoPOS. Pausado = sigue conectado a WhatsApp, pero ignora todo
+// mensaje entrante (no responde, no gasta Gemini/Supabase).
+app.get("/control", (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+  const token = (req.query.token as string | undefined) || "";
+  const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+  res.send(`
+    <body style="display:flex;flex-direction:column;align-items:center;font-family:sans-serif;margin-top:40px;gap:14px;">
+      <h2>Bot de WhatsApp: ${isPaused ? "PAUSADO" : "ACTIVO"}</h2>
+      <p>Conectado a WhatsApp: ${phoneNumberId ? `si (${phoneNumberId})` : "no"}</p>
+      <form method="POST" action="/control/${isPaused ? "resume" : "pause"}${qs}">
+        <button type="submit" style="font-size:18px;padding:10px 24px;">
+          ${isPaused ? "Reanudar" : "Pausar"}
+        </button>
+      </form>
+    </body>`);
+});
+
+app.post("/control/pause", (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+  isPaused = true;
+  console.log("Bot pausado manualmente via /control.");
+  res.redirect(`/control${req.query.token ? `?token=${encodeURIComponent(req.query.token as string)}` : ""}`);
+});
+
+app.post("/control/resume", (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+  isPaused = false;
+  console.log("Bot reanudado manualmente via /control.");
+  res.redirect(`/control${req.query.token ? `?token=${encodeURIComponent(req.query.token as string)}` : ""}`);
 });
 
 // El QR en logs de texto (Railway, etc.) sale distorsionado o cambia antes de
@@ -178,7 +216,7 @@ whatsappClient.on("ready", () => {
 });
 
 whatsappClient.on("message", async (msg: Message) => {
-  if (msg.fromMe || !phoneNumberId) return;
+  if (msg.fromMe || !phoneNumberId || isPaused) return;
 
   const isText = msg.type === "chat" && Boolean(msg.body?.trim());
   const isVoiceNote = (msg.type === "ptt" || msg.type === "audio") && msg.hasMedia;
