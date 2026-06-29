@@ -127,11 +127,14 @@ function clearStaleChromiumLock(): void {
 }
 clearStaleChromiumLock();
 
-// whatsapp-web.js inyecta codigo que llama funciones internas del bundle JS
-// de WhatsApp Web. Si se usa la version "en vivo" (la que sirve WhatsApp en
-// ese momento) puede ir mas adelante que lo que whatsapp-web.js soporta, y
-// fallar con errores como "X is not a function" al enviar mensajes. Fijar una
-// version conocida (publicada por la comunidad en wa-version) evita eso.
+// NOTA: aqui hubo un webVersionCache fijo a una version pineada de
+// wa-version (para evitar "X is not a function" al enviar con la version en
+// vivo). Pero en Railway esa version pineada hace crashear Client.inject()
+// con "Execution context was destroyed" -- WhatsApp parece haber cambiado
+// algo del lado del servidor que ya no es compatible con ese snapshot
+// estatico. Se quita el pin y se usa la version en vivo (comportamiento por
+// defecto de whatsapp-web.js); si vuelve a aparecer el error de envio, se
+// puede volver a pinear a una version mas reciente de wa-version.
 const whatsappClient = new Client({
   authStrategy: new LocalAuth({ clientId }),
   puppeteer: {
@@ -150,12 +153,9 @@ const whatsappClient = new Client({
     // variable, usa el Chromium que ya descargo Puppeteer por su cuenta.
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   },
-  webVersionCache: {
-    type: "remote",
-    remotePath:
-      process.env.WHATSAPP_WEB_VERSION_URL ||
-      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1039846915-alpha.html",
-  },
+  ...(process.env.WHATSAPP_WEB_VERSION_URL
+    ? { webVersionCache: { type: "remote" as const, remotePath: process.env.WHATSAPP_WEB_VERSION_URL } }
+    : {}),
 });
 
 whatsappClient.on("qr", (qr: string) => {
