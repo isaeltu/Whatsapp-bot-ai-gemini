@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
 import express from "express";
 import { Client, LocalAuth, Message } from "whatsapp-web.js";
 import qrcodeTerminal from "qrcode-terminal";
@@ -76,6 +78,27 @@ app.get("/qr", (_req, res) => {
 });
 
 app.listen(port, () => console.log(`Health check escuchando en puerto ${port}${clientId ? ` (clientId=${clientId})` : ""}`));
+
+// Chrome deja archivos de "lock" en el perfil para que dos procesos no usen
+// la misma sesion a la vez. En Docker con volumen persistente, si el
+// contenedor anterior crasheo o Railway lo reinicio, el lock queda en el
+// volumen pero referencia un hostname de contenedor que ya no existe -- el
+// Chrome nuevo lo ve y se niega a arrancar pensando que "otra maquina" sigue
+// usando el perfil. Como aqui solo corre una instancia a la vez, es seguro
+// borrar el lock viejo antes de arrancar.
+function clearStaleChromiumLock(): void {
+  const dataPath = path.resolve("./.wwebjs_auth");
+  const sessionDir = path.join(dataPath, clientId ? `session-${clientId}` : "session");
+  for (const file of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    try {
+      fs.unlinkSync(path.join(sessionDir, file));
+      console.log(`Lock de Chromium viejo eliminado: ${file}`);
+    } catch {
+      // No existia (primer arranque) o no se pudo borrar -- no es problema.
+    }
+  }
+}
+clearStaleChromiumLock();
 
 // whatsapp-web.js inyecta codigo que llama funciones internas del bundle JS
 // de WhatsApp Web. Si se usa la version "en vivo" (la que sirve WhatsApp en
