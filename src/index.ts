@@ -1,7 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import { Client, LocalAuth, Message } from "whatsapp-web.js";
-import qrcode from "qrcode-terminal";
+import qrcodeTerminal from "qrcode-terminal";
+import QRCode from "qrcode";
 
 import { interpretMessage } from "./gemini";
 import {
@@ -42,10 +43,38 @@ const port = Number(process.env.PORT) || 5000;
 // para que las distintas corridas nunca compartan ni pisen la sesion de WhatsApp.
 const clientId = process.env.BOT_CLIENT_ID || undefined;
 let phoneNumberId: string | null = null;
+let latestQr: string | null = null;
 
 const app = express();
 app.use(express.json());
 app.get("/health", (_req, res) => res.json({ ok: true, connected: Boolean(phoneNumberId), clientId: clientId ?? "default" }));
+
+// El QR en logs de texto (Railway, etc.) sale distorsionado o cambia antes de
+// poder escanearlo -- esta pagina sirve el QR como imagen real y se
+// autorrefresca, asi se puede abrir en el navegador y escanear normal.
+app.get("/qr", (_req, res) => {
+  if (phoneNumberId) {
+    res.send("<h1>Ya conectado</h1><p>El bot ya tiene una sesion activa de WhatsApp.</p>");
+    return;
+  }
+  if (!latestQr) {
+    res.send("<meta http-equiv='refresh' content='3'><p>Esperando que se genere el QR...</p>");
+    return;
+  }
+  QRCode.toDataURL(latestQr, { width: 320 }, (err, dataUrl) => {
+    if (err || !dataUrl) {
+      res.status(500).send("No se pudo generar la imagen del QR.");
+      return;
+    }
+    res.send(`<meta http-equiv="refresh" content="20">
+      <body style="display:flex;flex-direction:column;align-items:center;font-family:sans-serif;margin-top:40px;">
+        <h2>Escanea este QR con WhatsApp</h2>
+        <img src="${dataUrl}" width="320" height="320" />
+        <p>Esta pagina se refresca solo cada 20s (el QR expira y se genera uno nuevo).</p>
+      </body>`);
+  });
+});
+
 app.listen(port, () => console.log(`Health check escuchando en puerto ${port}${clientId ? ` (clientId=${clientId})` : ""}`));
 
 // whatsapp-web.js inyecta codigo que llama funciones internas del bundle JS
@@ -71,12 +100,14 @@ const whatsappClient = new Client({
 });
 
 whatsappClient.on("qr", (qr: string) => {
-  qrcode.generate(qr, { small: true });
-  console.log("Escanea este QR con WhatsApp en tu telefono.");
+  latestQr = qr;
+  qrcodeTerminal.generate(qr, { small: true });
+  console.log("Escanea este QR con WhatsApp en tu telefono (o abre /qr en el navegador si estas en un servidor).");
 });
 
 whatsappClient.on("ready", () => {
   phoneNumberId = whatsappClient.info.wid.user;
+  latestQr = null;
   console.log(`WhatsApp listo${clientId ? ` (clientId=${clientId})` : ""}. Numero del bot: ${phoneNumberId}`);
   console.log('Verifica que ese mismo numero este en RestoPOS -> Configuracion -> "Bot de WhatsApp".');
 });
