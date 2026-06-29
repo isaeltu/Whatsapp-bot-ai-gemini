@@ -23,14 +23,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # sistema que ya instalamos arriba) en vez de que Puppeteer descargue el suyo.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# --include=dev explicito: NODE_ENV=production (puesto mas abajo, para el
+# proceso en runtime) hace que npm se salte devDependencies por defecto, pero
+# typescript/@types/* son devDependencies y se necesitan para compilar.
+RUN npm ci --include=dev
 
 COPY . .
 RUN npm run build
 
+ENV NODE_ENV=production
 CMD ["node", "dist/index.js"]
