@@ -47,14 +47,41 @@ const clientId = process.env.BOT_CLIENT_ID || undefined;
 let phoneNumberId: string | null = null;
 let latestQr: string | null = null;
 
+// /qr y /health quedan en una URL publica de Railway -- sin esto, cualquiera
+// que adivine o encuentre esa URL podria ver el estado del bot, o peor,
+// escanear el QR el mismo y secuestrar la sesion de WhatsApp antes que el
+// dueno real. BOT_ADMIN_TOKEN exige ?token=... que coincida para ver
+// cualquiera de las dos rutas.
+const adminToken = process.env.BOT_ADMIN_TOKEN;
+if (!adminToken) {
+  console.warn(
+    "BOT_ADMIN_TOKEN no esta configurado: /qr y /health quedan PUBLICOS sin clave. " +
+      "Configuralo en producción (ver .env.example).",
+  );
+}
+
+function requireAdminToken(req: express.Request, res: express.Response): boolean {
+  if (!adminToken) return true;
+  const provided = (req.query.token as string | undefined) || req.header("x-admin-token");
+  if (provided !== adminToken) {
+    res.status(403).send("Forbidden");
+    return false;
+  }
+  return true;
+}
+
 const app = express();
 app.use(express.json());
-app.get("/health", (_req, res) => res.json({ ok: true, connected: Boolean(phoneNumberId), clientId: clientId ?? "default" }));
+app.get("/health", (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+  res.json({ ok: true, connected: Boolean(phoneNumberId), clientId: clientId ?? "default" });
+});
 
 // El QR en logs de texto (Railway, etc.) sale distorsionado o cambia antes de
 // poder escanearlo -- esta pagina sirve el QR como imagen real y se
 // autorrefresca, asi se puede abrir en el navegador y escanear normal.
-app.get("/qr", (_req, res) => {
+app.get("/qr", (req, res) => {
+  if (!requireAdminToken(req, res)) return;
   if (phoneNumberId) {
     res.send("<h1>Ya conectado</h1><p>El bot ya tiene una sesion activa de WhatsApp.</p>");
     return;
