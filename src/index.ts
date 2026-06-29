@@ -1,5 +1,6 @@
 import "dotenv/config";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import express from "express";
 import { Client, LocalAuth, Message } from "whatsapp-web.js";
@@ -27,6 +28,11 @@ import {
 } from "./memory";
 import { isRateLimited } from "./rateLimiter";
 import { IncomingMessage, MenuSnapshot, OrderItem } from "./types";
+
+console.log(
+  `[diagnostico] Node ${process.version} arch=${process.arch} cpus=${os.cpus().length} ` +
+    `memTotal=${(os.totalmem() / 1024 / 1024).toFixed(0)}MB memFree=${(os.freemem() / 1024 / 1024).toFixed(0)}MB`,
+);
 
 const port = Number(process.env.PORT) || 5000;
 
@@ -193,7 +199,39 @@ whatsappClient.on("message", async (msg: Message) => {
   }
 });
 
-whatsappClient.initialize();
+function memorySnapshot(): string {
+  return `memFree=${(os.freemem() / 1024 / 1024).toFixed(0)}MB de memTotal=${(os.totalmem() / 1024 / 1024).toFixed(0)}MB`;
+}
+
+let initAttempts = 0;
+
+// whatsappClient.initialize() puede fallar (crash de Chromium al inyectar el
+// script de WhatsApp Web). Sin este catch, un rechazo de promesa sin manejar
+// tumba TODO el proceso (Node 15+) y Railway reinicia el contenedor entero
+// desde cero -- mas lento, y se pierde la chance de loguear el estado exacto
+// (memoria libre) en el momento del crash. Aqui se loguea ese diagnostico y
+// se reintenta in-process unas pocas veces antes de rendirse.
+function startWhatsApp(): void {
+  initAttempts += 1;
+  console.log(`[diagnostico] Intento de conexion #${initAttempts}. ${memorySnapshot()}`);
+  whatsappClient.initialize().catch(async (error) => {
+    console.error(`[diagnostico] Fallo whatsappClient.initialize(). ${memorySnapshot()}`);
+    console.error(error);
+    // Cierra el browser a medio lanzar (si quedo alguno) antes de reintentar,
+    // para no acumular procesos de Chrome zombie en cada intento.
+    await whatsappClient.destroy().catch(() => {});
+    clearStaleChromiumLock();
+    if (initAttempts < 3) {
+      console.log("Reintentando en 10s...");
+      setTimeout(startWhatsApp, 10_000);
+    } else {
+      console.error("Se agotaron los reintentos in-process. Termina el proceso para que Railway reinicie el contenedor.");
+      process.exit(1);
+    }
+  });
+}
+
+startWhatsApp();
 
 // WhatsApp identifica algunos chats por un "LID" (@lid, un id de privacidad)
 // en vez del numero real (@c.us) -- pasa sobre todo con cuentas/numeros mas
