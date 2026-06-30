@@ -6,6 +6,7 @@ export type RestaurantInfo = {
   extraPrompt: string;
   businessHours: unknown;
   notificationEmail: string | null;
+  paymentEnabled: boolean;
 };
 
 export type Category = {
@@ -55,7 +56,7 @@ export type OrderItem = {
   notes?: string;
 };
 
-export type LlmIntent = "chat" | "order" | "handoff";
+export type LlmIntent = "chat" | "order" | "card_payment" | "handoff";
 
 export type LlmResult = {
   intent: LlmIntent;
@@ -78,6 +79,11 @@ export type CreateOrderResult = {
   orderNumber: string;
   total: number;
   notificationEmail: string | null;
+};
+
+export type CreatePaymentLinkResult = {
+  linkId: string;
+  total: number;
 };
 
 export type UpsertCustomerResult = {

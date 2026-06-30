@@ -1,12 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 import {
   CreateOrderResult,
+  CreatePaymentLinkResult,
   MenuSnapshot,
   OrderItem,
   UpsertCustomerResult,
 } from "./types";
 
-const supabaseUrl = process.env.SUPABASE_URL;
+export const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
@@ -70,6 +71,34 @@ export async function createOrder(
   return data as CreateOrderResult;
 }
 
+// Crea un link de pago pendiente (NO una orden todavia -- la orden se crea
+// recien cuando Cardnet confirma el pago, ver bot_confirm_payment_link en
+// la migracion 202606300003).
+export async function createPaymentLink(
+  phoneNumberId: string,
+  customerPhone: string,
+  customerName: string,
+  customerEmail: string,
+  items: OrderItem[],
+  deliveryType: string,
+  deliveryAddress: string
+): Promise<CreatePaymentLinkResult | null> {
+  const { data, error } = await supabase.rpc("bot_create_payment_link", {
+    p_phone_number_id: phoneNumberId,
+    p_customer_phone: customerPhone,
+    p_customer_name: customerName || null,
+    p_customer_email: customerEmail || null,
+    p_items: items,
+    p_delivery_type: deliveryType || null,
+    p_delivery_address: deliveryAddress || null,
+  });
+  if (error) {
+    console.warn("bot_create_payment_link fallo:", error.message);
+    return null;
+  }
+  return data as CreatePaymentLinkResult;
+}
+
 export async function createHandoff(
   phoneNumberId: string,
   customerPhone: string,
@@ -87,6 +116,39 @@ export async function createHandoff(
   if (error) {
     console.warn("bot_create_handoff fallo:", error.message);
   }
+}
+
+export async function getPaymentLinkForCharge(linkId: string): Promise<Record<string, unknown> | null> {
+  const { data, error } = await supabase.rpc("bot_get_payment_link_for_charge", { p_link_id: linkId });
+  if (error || !data) return null;
+  return data as Record<string, unknown>;
+}
+
+export async function setPaymentLinkSession(linkId: string, session: string, sessionKey: string): Promise<void> {
+  await supabase.rpc("bot_set_payment_link_session", {
+    p_link_id: linkId,
+    p_session: session,
+    p_session_key: sessionKey,
+  });
+}
+
+// Pide a la Edge Function generate-order-invoice-pdf el mismo PDF de factura
+// que descarga el boton "Descargar PDF" del POS (sin logo, ver el README de
+// esa funcion), para adjuntarlo como documento en WhatsApp justo despues de
+// crear el pedido.
+export async function getOrderInvoicePdf(
+  phoneNumberId: string,
+  orderId: string,
+): Promise<{ bytes: Uint8Array; filename: string } | null> {
+  const { data, error } = await supabase.functions.invoke<{ pdfBase64: string; filename: string }>(
+    "generate-order-invoice-pdf",
+    { body: { phone_number_id: phoneNumberId, order_id: orderId } },
+  );
+  if (error || !data?.pdfBase64) {
+    console.warn("generate-order-invoice-pdf fallo:", error?.message);
+    return null;
+  }
+  return { bytes: Buffer.from(data.pdfBase64, "base64"), filename: data.filename || `factura-${orderId}.pdf` };
 }
 
 export async function notifyNewOrder(payload: {
