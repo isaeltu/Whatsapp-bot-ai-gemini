@@ -30,6 +30,7 @@ import {
 import { isRateLimited } from "./rateLimiter";
 import { downloadMedia, sendWhatsAppDocument, sendWhatsAppText, uploadMedia } from "./metaWhatsapp";
 import { IncomingMessage, MenuSnapshot, OrderItem } from "./types";
+import { startEcfStatusPoller } from "./ecf/ecfPoller";
 
 console.log(
   `[diagnostico] Node ${process.version} arch=${process.arch} cpus=${os.cpus().length} ` +
@@ -118,6 +119,52 @@ app.post("/control/resume", (req, res) => {
   isPaused = false;
   console.log("Bot reanudado manualmente via /control.");
   res.redirect(`/control${req.query.token ? `?token=${encodeURIComponent(req.query.token as string)}` : ""}`);
+});
+
+// Genera y envía un e-CF a la DGII para una orden ya pagada.
+// Llamado desde Restpo (POS) cuando el cajero cierra la orden.
+// Header requerido: x-admin-token
+app.post("/internal/generate-ecf", async (req, res) => {
+  const provided = req.header("x-admin-token");
+  if (!adminToken || provided !== adminToken) {
+    res.status(403).send("Forbidden");
+    return;
+  }
+  const { generateAndSendEcf } = await import("./ecf/ecfService");
+  const body = req.body ?? {};
+  if (!body.restaurantId || !body.orderId) {
+    res.status(400).json({ error: "Faltan restaurantId y orderId." });
+    return;
+  }
+  try {
+    const result = await generateAndSendEcf(body);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+// Genera una E34 (Nota de Crédito) para anular un comprobante ya emitido.
+// Llamado desde Restpo cuando un admin cancela una orden que tenía e-CF.
+// Header requerido: x-admin-token
+app.post("/internal/generate-ecf-credit-note", async (req, res) => {
+  const provided = req.header("x-admin-token");
+  if (!adminToken || provided !== adminToken) {
+    res.status(403).send("Forbidden");
+    return;
+  }
+  const { generateCreditNote } = await import("./ecf/ecfService");
+  const body = req.body ?? {};
+  if (!body.restaurantId || !body.orderId || !body.originalEncf || !body.originalDate) {
+    res.status(400).json({ error: "Faltan restaurantId, orderId, originalEncf u originalDate." });
+    return;
+  }
+  try {
+    const result = await generateCreditNote(body);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
 });
 
 // Llamado por la Edge Function cardnet-payment-return justo despues de
@@ -304,7 +351,10 @@ app.post("/webhook", (req, res) => {
   });
 });
 
-app.listen(port, () => console.log(`Bot escuchando en puerto ${port}`));
+app.listen(port, () => {
+  console.log(`Bot escuchando en puerto ${port}`);
+  startEcfStatusPoller();
+});
 
 type MetaWebhookBody = {
   entry?: Array<{
