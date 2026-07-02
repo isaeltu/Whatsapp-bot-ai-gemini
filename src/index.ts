@@ -5,6 +5,10 @@ import express from "express";
 
 import { interpretMessage } from "./gemini";
 import {
+  botPauseConversation,
+  botSaveMessage,
+  botUpsertConversation,
+  type ConvInfo,
   createHandoff,
   createOrder,
   createPaymentLink,
@@ -416,6 +420,12 @@ async function handleWebhookPayload(body: MetaWebhookBody): Promise<void> {
   }
 }
 
+const HUMAN_KEYWORDS = [
+  "hablar con persona", "hablar con alguien", "quiero un agente",
+  "atencion humana", "soporte humano", "representante", "supervisor",
+  "necesito ayuda de verdad", "no me entiende",
+];
+
 async function handleIncomingMessage(
   phoneNumberId: string,
   from: string,
@@ -427,6 +437,34 @@ async function handleIncomingMessage(
     console.warn(`Bot de WhatsApp deshabilitado para el numero ${phoneNumberId}; mensaje ignorado.`);
     return;
   }
+
+  // --- Chat panel: registra conversacion y verifica si el bot esta pausado ---
+  const conv = await botUpsertConversation(phoneNumberId, from).catch(() => null) as ConvInfo | null;
+  if (conv) {
+    botSaveMessage(conv.id, conv.restaurantId, "inbound", "customer", messageLabel).catch(() => {});
+    if (conv.botPaused) {
+      console.log(`[chat] Conversacion ${from} en modo humano; mensaje guardado, IA no responde.`);
+      return;
+    }
+  }
+
+  // Deteccion explicita de solicitud de humano (antes de llamar a Gemini)
+  if (
+    incoming.kind === "text" &&
+    HUMAN_KEYWORDS.some((k) => incoming.text.toLowerCase().includes(k))
+  ) {
+    const replyText = "Entendido! Te conecto con uno de nuestros agentes. En un momento te atienden. 👋";
+    const state = await getState(from);
+    recordBotMessage(state, replyText);
+    await saveState(from, state);
+    if (conv) {
+      await botPauseConversation(conv.id, "Cliente solicito atencion humana").catch(() => {});
+      botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
+    }
+    await safeReply(phoneNumberId, from, replyText);
+    return;
+  }
+  // --------------------------------------------------------------------------
 
   const state = await getState(from);
   recordCustomerMessage(state, messageLabel);
@@ -445,8 +483,10 @@ async function handleIncomingMessage(
     await saveState(from, state);
     if (shouldHandoff) {
       await createHandoff(phoneNumberId, from, state.profile.name, "no_entendido", messageExcerpt);
+      if (conv) await botPauseConversation(conv.id, "no_entendido").catch(() => {});
     }
     await safeReply(phoneNumberId, from, replyText);
+    if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
     return;
   }
 
@@ -461,39 +501,27 @@ async function handleIncomingMessage(
   const profile = state.profile;
 
   if (llmResult.intent === "order") {
-    await handleOrderIntent(
-      phoneNumberId,
-      from,
-      profile.name,
-      profile.email,
-      llmResult.items,
-      menu,
-      state.deliveryType,
-      state.deliveryAddress,
-    );
+    await handleOrderIntent(phoneNumberId, from, profile.name, profile.email,
+      llmResult.items, menu, state.deliveryType, state.deliveryAddress, conv);
     return;
   }
 
   if (llmResult.intent === "card_payment") {
-    await handleCardPaymentIntent(
-      phoneNumberId,
-      from,
-      profile.name,
-      profile.email,
-      llmResult.items,
-      state.deliveryType,
-      state.deliveryAddress,
-    );
+    await handleCardPaymentIntent(phoneNumberId, from, profile.name, profile.email,
+      llmResult.items, state.deliveryType, state.deliveryAddress, conv);
     return;
   }
 
   if (llmResult.intent === "handoff") {
     await createHandoff(phoneNumberId, from, profile.name, llmResult.reason, messageExcerpt);
+    if (conv) await botPauseConversation(conv.id, llmResult.reason || "handoff").catch(() => {});
     await safeReply(phoneNumberId, from, llmResult.replyText);
+    if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", llmResult.replyText).catch(() => {});
     return;
   }
 
   await safeReply(phoneNumberId, from, llmResult.replyText);
+  if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", llmResult.replyText).catch(() => {});
 }
 
 async function handleOrderIntent(
@@ -505,6 +533,7 @@ async function handleOrderIntent(
   menu: MenuSnapshot,
   deliveryType: string,
   deliveryAddress: string,
+  conv: ConvInfo | null = null,
 ): Promise<void> {
   const customer = await upsertCustomer(phoneNumberId, customerName, customerEmail);
   if (!customer) {
@@ -573,6 +602,7 @@ async function handleOrderIntent(
   recordBotMessage(state, replyText);
   await saveState(from, state);
   await safeReply(phoneNumberId, from, replyText);
+  if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
   await safeSendInvoice(phoneNumberId, from, order.orderId);
 }
 
@@ -599,6 +629,7 @@ async function handleCardPaymentIntent(
   items: OrderItem[],
   deliveryType: string,
   deliveryAddress: string,
+  conv: ConvInfo | null = null,
 ): Promise<void> {
   const link = await createPaymentLink(phoneNumberId, from, customerName, customerEmail, items, deliveryType, deliveryAddress);
   if (!link) {
@@ -621,6 +652,7 @@ async function handleCardPaymentIntent(
   recordBotMessage(state, replyText);
   await saveState(from, state);
   await safeReply(phoneNumberId, from, replyText);
+  if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
 }
 
 async function safeReply(phoneNumberId: string, to: string, text: string): Promise<void> {

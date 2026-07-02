@@ -151,6 +151,64 @@ export async function getOrderInvoicePdf(
   return { bytes: Buffer.from(data.pdfBase64, "base64"), filename: data.filename || `factura-${orderId}.pdf` };
 }
 
+// ============================================================
+// Chat panel: conversaciones y mensajes
+// ============================================================
+
+export type ConvInfo = {
+  id: string;
+  restaurantId: string;
+  botPaused: boolean;
+};
+
+export async function botUpsertConversation(
+  phoneNumberId: string,
+  customerPhone: string,
+  customerName?: string,
+): Promise<ConvInfo | null> {
+  const { data, error } = await supabase.rpc("bot_upsert_conversation", {
+    p_phone_number_id: phoneNumberId,
+    p_customer_phone:  customerPhone,
+    p_customer_name:   customerName ?? null,
+  });
+  if (error || !data) {
+    console.warn("bot_upsert_conversation fallo:", error?.message);
+    return null;
+  }
+  const row = data as { id: string; restaurant_id: string; bot_paused: boolean };
+  return { id: row.id, restaurantId: row.restaurant_id, botPaused: row.bot_paused };
+}
+
+export async function botSaveMessage(
+  conversationId: string,
+  restaurantId: string,
+  direction: "inbound" | "outbound",
+  senderType: "customer" | "bot" | "human" | "system",
+  content: string,
+  waMessageId?: string,
+): Promise<void> {
+  const { error } = await supabase.rpc("bot_save_message", {
+    p_conversation_id: conversationId,
+    p_restaurant_id:   restaurantId,
+    p_direction:       direction,
+    p_sender_type:     senderType,
+    p_content:         content,
+    p_wa_message_id:   waMessageId ?? null,
+  });
+  if (error) console.warn("bot_save_message fallo:", error.message);
+}
+
+export async function botPauseConversation(
+  conversationId: string,
+  reason?: string,
+): Promise<void> {
+  const { error } = await supabase.rpc("bot_pause_conversation", {
+    p_conversation_id: conversationId,
+    p_reason:          reason ?? null,
+  });
+  if (error) console.warn("bot_pause_conversation fallo:", error.message);
+}
+
 export async function notifyNewOrder(payload: {
   to: string;
   restaurantName: string;
