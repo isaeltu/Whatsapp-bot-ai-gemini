@@ -9,12 +9,15 @@ import {
   botSaveMessage,
   botUpsertConversation,
   type ConvInfo,
+  type WhatsappIntegrationCredentials,
   createHandoff,
   createOrder,
   createPaymentLink,
   getMenu,
   getOrderInvoicePdf,
   getPaymentLinkForCharge,
+  getWhatsappIntegration,
+  getWhatsappIntegrationByPhoneNumber,
   notifyNewOrder,
   setPaymentLinkSession,
   supabaseUrl,
@@ -54,6 +57,13 @@ if (!appSecret) {
       "Configuralo antes de produccion (ver .env.example).",
   );
 }
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY || !process.env.WHATSAPP_CREDENTIALS_KEY) {
+  console.warn(
+    "Falta SUPABASE_SERVICE_ROLE_KEY y/o WHATSAPP_CREDENTIALS_KEY: las rutas multi-cliente " +
+      "/webhook/meta/:integrationId responderan 404 porque no se pueden leer las credenciales " +
+      "cifradas de whatsapp_integrations. Solo funcionara el /webhook legacy con el token global.",
+  );
+}
 
 // Pausa logica: el proceso sigue corriendo y el webhook sigue respondiendo
 // 200 a Meta (si no, Meta reintenta y luego puede desactivar el webhook),
@@ -77,6 +87,27 @@ function requireAdminToken(req: express.Request, res: express.Response): boolean
     return false;
   }
   return true;
+}
+
+type RuntimeWhatsAppCredentials = Pick<WhatsappIntegrationCredentials, "accessToken" | "appSecret" | "verifyTokenHash" | "phoneNumberId">;
+
+function hashVerifyToken(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function verifyIntegrationToken(credentials: RuntimeWhatsAppCredentials, token: unknown): boolean {
+  return typeof token === "string" && hashVerifyToken(token) === credentials.verifyTokenHash;
+}
+
+async function resolveCredentialsForPhone(
+  phoneNumberId: string,
+  credentials?: RuntimeWhatsAppCredentials | null,
+): Promise<RuntimeWhatsAppCredentials | null> {
+  if (credentials?.phoneNumberId === phoneNumberId) return credentials;
+  return getWhatsappIntegrationByPhoneNumber(phoneNumberId).catch((error) => {
+    console.warn(`No se pudieron resolver credenciales WhatsApp para ${phoneNumberId}:`, error?.message || error);
+    return null;
+  });
 }
 
 const app = express();
@@ -206,11 +237,12 @@ async function notifyCardPaymentConfirmed(
   const replyText = `Pago recibido! Tu pedido ${orderNumber ?? orderId} quedo registrado y pagado${
     totalText ? ` (${totalText})` : ""
   }. Gracias por tu compra.`;
+  const credentials = await resolveCredentialsForPhone(phoneNumberId);
   const state = await getState(to);
   recordBotMessage(state, replyText);
   await saveState(to, state);
-  await safeReply(phoneNumberId, to, replyText);
-  await safeSendInvoice(phoneNumberId, to, orderId);
+  await safeReply(phoneNumberId, to, replyText, credentials);
+  await safeSendInvoice(phoneNumberId, to, orderId, credentials);
 }
 
 // Pagina de pago que el bot manda por WhatsApp. Corre en el servidor Express
@@ -328,12 +360,56 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-function isValidSignature(req: express.Request): boolean {
-  if (!appSecret) return true;
+app.get("/webhook/meta/:integrationId", async (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  try {
+    const credentials = await getWhatsappIntegration(req.params.integrationId);
+    if (mode === "subscribe" && credentials && verifyIntegrationToken(credentials, token)) {
+      console.log(`Verificacion de webhook Meta OK para integracion ${req.params.integrationId}.`);
+      res.status(200).send(challenge);
+      return;
+    }
+  } catch (error) {
+    console.warn("No se pudo verificar integracion WhatsApp:", error);
+  }
+  console.warn(`Verificacion de webhook Meta fallo para integracion ${req.params.integrationId}.`);
+  res.sendStatus(403);
+});
+
+app.post("/webhook/meta/:integrationId", async (req, res) => {
+  let credentials: WhatsappIntegrationCredentials | null = null;
+  try {
+    credentials = await getWhatsappIntegration(req.params.integrationId);
+  } catch (error) {
+    console.error("No se pudieron cargar credenciales WhatsApp:", error);
+  }
+
+  if (!credentials) {
+    res.sendStatus(404);
+    return;
+  }
+
+  res.sendStatus(200);
+
+  if (!isValidSignature(req, credentials.appSecret)) {
+    console.warn(`[diagnostico] Firma invalida para integracion ${req.params.integrationId}; payload ignorado.`);
+    return;
+  }
+
+  handleWebhookPayload(req.body, credentials).catch((error) => {
+    console.error("Error procesando webhook de Meta:", error);
+  });
+});
+
+function isValidSignature(req: express.Request, secretOverride?: string): boolean {
+  const secret = secretOverride || appSecret;
+  if (!secret) return true;
   const signature = req.header("x-hub-signature-256");
   const rawBody = (req as express.Request & { rawBody?: Buffer }).rawBody;
   if (!signature || !rawBody) return false;
-  const expected = "sha256=" + crypto.createHmac("sha256", appSecret).update(rawBody).digest("hex");
+  const expected = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
   const a = Buffer.from(signature);
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -376,13 +452,19 @@ type MetaWebhookBody = {
   }>;
 };
 
-async function handleWebhookPayload(body: MetaWebhookBody): Promise<void> {
+async function handleWebhookPayload(body: MetaWebhookBody, credentials?: RuntimeWhatsAppCredentials | null): Promise<void> {
   const value = body?.entry?.[0]?.changes?.[0]?.value;
   const phoneNumberId = value?.metadata?.phone_number_id;
   const message = value?.messages?.[0];
   // El mismo webhook tambien manda actualizaciones de estado (sent/delivered/
   // read) sin "messages" -- no son mensajes de un cliente, se ignoran.
   if (!phoneNumberId || !message || isPaused) return;
+  if (credentials && credentials.phoneNumberId !== phoneNumberId) {
+    console.warn(
+      `[diagnostico] Payload ignorado: phoneNumberId ${phoneNumberId} no coincide con integracion ${credentials.phoneNumberId}.`,
+    );
+    return;
+  }
 
   const from = message.from;
   console.log(`[diagnostico] Mensaje entrante. from=${from} type=${message.type} phoneNumberId=${phoneNumberId}`);
@@ -400,7 +482,7 @@ async function handleWebhookPayload(body: MetaWebhookBody): Promise<void> {
     incoming = { kind: "text", text };
     messageLabel = text;
   } else if (message.type === "audio" && message.audio?.id) {
-    const media = await downloadMedia(message.audio.id);
+    const media = await downloadMedia(message.audio.id, credentials?.accessToken);
     if (!media) {
       console.warn("No se pudo descargar la nota de voz; mensaje ignorado.");
       return;
@@ -413,10 +495,10 @@ async function handleWebhookPayload(body: MetaWebhookBody): Promise<void> {
   }
 
   try {
-    await handleIncomingMessage(phoneNumberId, from, incoming, messageLabel);
+    await handleIncomingMessage(phoneNumberId, from, incoming, messageLabel, credentials);
   } catch (error) {
     console.error("Error procesando mensaje:", error);
-    await safeReply(phoneNumberId, from, "Disculpa, tuvimos un problema tecnico. Intenta de nuevo en un momento.");
+    await safeReply(phoneNumberId, from, "Disculpa, tuvimos un problema tecnico. Intenta de nuevo en un momento.", credentials);
   }
 }
 
@@ -431,6 +513,7 @@ async function handleIncomingMessage(
   from: string,
   incoming: IncomingMessage,
   messageLabel: string,
+  credentials?: RuntimeWhatsAppCredentials | null,
 ): Promise<void> {
   const menu = await getMenu(phoneNumberId);
   if (!menu) {
@@ -461,7 +544,7 @@ async function handleIncomingMessage(
       await botPauseConversation(conv.id, "Cliente solicito atencion humana").catch(() => {});
       botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
     }
-    await safeReply(phoneNumberId, from, replyText);
+    await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
   // --------------------------------------------------------------------------
@@ -485,7 +568,7 @@ async function handleIncomingMessage(
       await createHandoff(phoneNumberId, from, state.profile.name, "no_entendido", messageExcerpt);
       if (conv) await botPauseConversation(conv.id, "no_entendido").catch(() => {});
     }
-    await safeReply(phoneNumberId, from, replyText);
+    await safeReply(phoneNumberId, from, replyText, credentials);
     if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
     return;
   }
@@ -502,25 +585,25 @@ async function handleIncomingMessage(
 
   if (llmResult.intent === "order") {
     await handleOrderIntent(phoneNumberId, from, profile.name, profile.email,
-      llmResult.items, menu, state.deliveryType, state.deliveryAddress, conv);
+      llmResult.items, menu, state.deliveryType, state.deliveryAddress, conv, credentials);
     return;
   }
 
   if (llmResult.intent === "card_payment") {
     await handleCardPaymentIntent(phoneNumberId, from, profile.name, profile.email,
-      llmResult.items, state.deliveryType, state.deliveryAddress, conv);
+      llmResult.items, state.deliveryType, state.deliveryAddress, conv, credentials);
     return;
   }
 
   if (llmResult.intent === "handoff") {
     await createHandoff(phoneNumberId, from, profile.name, llmResult.reason, messageExcerpt);
     if (conv) await botPauseConversation(conv.id, llmResult.reason || "handoff").catch(() => {});
-    await safeReply(phoneNumberId, from, llmResult.replyText);
+    await safeReply(phoneNumberId, from, llmResult.replyText, credentials);
     if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", llmResult.replyText).catch(() => {});
     return;
   }
 
-  await safeReply(phoneNumberId, from, llmResult.replyText);
+  await safeReply(phoneNumberId, from, llmResult.replyText, credentials);
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", llmResult.replyText).catch(() => {});
 }
 
@@ -534,6 +617,7 @@ async function handleOrderIntent(
   deliveryType: string,
   deliveryAddress: string,
   conv: ConvInfo | null = null,
+  credentials?: RuntimeWhatsAppCredentials | null,
 ): Promise<void> {
   const customer = await upsertCustomer(phoneNumberId, customerName, customerEmail);
   if (!customer) {
@@ -542,7 +626,7 @@ async function handleOrderIntent(
     const state = await getState(from);
     recordBotMessage(state, replyText);
     await saveState(from, state);
-    await safeReply(phoneNumberId, from, replyText);
+    await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
 
@@ -561,7 +645,7 @@ async function handleOrderIntent(
     const state = await getState(from);
     recordBotMessage(state, replyText);
     await saveState(from, state);
-    await safeReply(phoneNumberId, from, replyText);
+    await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
 
@@ -601,21 +685,26 @@ async function handleOrderIntent(
   const state = await getState(from);
   recordBotMessage(state, replyText);
   await saveState(from, state);
-  await safeReply(phoneNumberId, from, replyText);
+  await safeReply(phoneNumberId, from, replyText, credentials);
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
-  await safeSendInvoice(phoneNumberId, from, order.orderId);
+  await safeSendInvoice(phoneNumberId, from, order.orderId, credentials);
 }
 
 // Manda la factura en PDF justo despues de confirmar el pedido (misma
 // conversacion, dentro de la ventana de 24h gratis de WhatsApp). No bloquea
 // ni rompe el flujo si falla -- el pedido y la confirmacion de texto ya
 // quedaron bien de todos modos.
-async function safeSendInvoice(phoneNumberId: string, to: string, orderId: string): Promise<void> {
+async function safeSendInvoice(
+  phoneNumberId: string,
+  to: string,
+  orderId: string,
+  credentials?: RuntimeWhatsAppCredentials | null,
+): Promise<void> {
   try {
     const invoice = await getOrderInvoicePdf(phoneNumberId, orderId);
     if (!invoice) return;
-    const mediaId = await uploadMedia(phoneNumberId, invoice.bytes, "application/pdf", invoice.filename);
-    await sendWhatsAppDocument(phoneNumberId, to, mediaId, invoice.filename, "Aqui tienes tu factura.");
+    const mediaId = await uploadMedia(phoneNumberId, invoice.bytes, "application/pdf", invoice.filename, credentials?.accessToken);
+    await sendWhatsAppDocument(phoneNumberId, to, mediaId, invoice.filename, "Aqui tienes tu factura.", credentials?.accessToken);
   } catch (err) {
     console.error("Fallo al mandar la factura en PDF:", err);
   }
@@ -630,6 +719,7 @@ async function handleCardPaymentIntent(
   deliveryType: string,
   deliveryAddress: string,
   conv: ConvInfo | null = null,
+  credentials?: RuntimeWhatsAppCredentials | null,
 ): Promise<void> {
   const link = await createPaymentLink(phoneNumberId, from, customerName, customerEmail, items, deliveryType, deliveryAddress);
   if (!link) {
@@ -638,7 +728,7 @@ async function handleCardPaymentIntent(
     const state = await getState(from);
     recordBotMessage(state, replyText);
     await saveState(from, state);
-    await safeReply(phoneNumberId, from, replyText);
+    await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
 
@@ -651,13 +741,18 @@ async function handleCardPaymentIntent(
   const state = await getState(from);
   recordBotMessage(state, replyText);
   await saveState(from, state);
-  await safeReply(phoneNumberId, from, replyText);
+  await safeReply(phoneNumberId, from, replyText, credentials);
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
 }
 
-async function safeReply(phoneNumberId: string, to: string, text: string): Promise<void> {
+async function safeReply(
+  phoneNumberId: string,
+  to: string,
+  text: string,
+  credentials?: RuntimeWhatsAppCredentials | null,
+): Promise<void> {
   try {
-    await sendWhatsAppText(phoneNumberId, to, text);
+    await sendWhatsAppText(phoneNumberId, to, text, credentials?.accessToken);
   } catch (err) {
     console.error("Fallo al enviar mensaje de WhatsApp:", err);
   }

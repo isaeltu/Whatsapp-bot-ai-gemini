@@ -1,6 +1,11 @@
 import ECF, { P12Reader, Transformer, ENVIRONMENT, Signature, convertECF32ToRFCE } from 'dgii-ecf';
-import { supabase } from '../supabaseClient';
+import { getWhatsappIntegrationByPhoneNumber, supabase } from '../supabaseClient';
 import { sendWhatsAppText } from '../metaWhatsapp';
+
+async function resolveWhatsAppAccessToken(phoneNumberId: string): Promise<string | undefined> {
+  const integration = await getWhatsappIntegrationByPhoneNumber(phoneNumberId).catch(() => null);
+  return integration?.accessToken;
+}
 
 export interface EcfOrderItem {
   name: string;
@@ -303,10 +308,14 @@ export async function generateAndSendEcf(data: EcfOrderData): Promise<EcfResult>
     // Notificar al cliente por WhatsApp (solo pedidos de canal WhatsApp)
     if (data.customerPhone && data.phoneNumberId) {
       const ecfMsg =
-        `✅ *Comprobante Fiscal Electronico emitido*\n` +
-        `e-NCF: *${encf}*\n` +
+        `✅ *Comprobante Fiscal Electronico emitido*
+` +
+        `e-NCF: *${encf}*
+` +
         `Puedes verificarlo en: ecf.dgii.gov.do`;
-      sendWhatsAppText(data.phoneNumberId, data.customerPhone, ecfMsg).catch((err: unknown) => {
+      resolveWhatsAppAccessToken(data.phoneNumberId)
+        .then((token) => sendWhatsAppText(data.phoneNumberId!, data.customerPhone!, ecfMsg, token))
+        .catch((err: unknown) => {
         console.warn('[ECF] No se pudo enviar e-NCF por WhatsApp:', err);
       });
     }
@@ -430,11 +439,16 @@ export async function generateCreditNote(data: EcfCreditNoteData): Promise<EcfRe
 
     if (data.customerPhone && data.phoneNumberId) {
       const msg =
-        `📋 *Nota de Credito emitida*\n` +
-        `e-NCF: *${encf}*\n` +
-        `Anula: ${data.originalEncf}\n` +
+        `📋 *Nota de Credito emitida*
+` +
+        `e-NCF: *${encf}*
+` +
+        `Anula: ${data.originalEncf}
+` +
         `Puedes verificarlo en: ecf.dgii.gov.do`;
-      sendWhatsAppText(data.phoneNumberId, data.customerPhone, msg).catch((err: unknown) => {
+      resolveWhatsAppAccessToken(data.phoneNumberId)
+        .then((token) => sendWhatsAppText(data.phoneNumberId!, data.customerPhone!, msg, token))
+        .catch((err: unknown) => {
         console.warn('[ECF] No se pudo enviar nota de credito por WhatsApp:', err);
       });
     }

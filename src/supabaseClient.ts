@@ -9,12 +9,79 @@ import {
 
 export const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const whatsappCredentialsKey = process.env.WHATSAPP_CREDENTIALS_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error("Faltan SUPABASE_URL / SUPABASE_ANON_KEY en el .env");
 }
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const supabaseService = supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey) : null;
+
+export type WhatsappIntegrationCredentials = {
+  id: string;
+  restaurantId: string;
+  providerType: string;
+  phoneNumberId: string;
+  displayPhoneNumber: string | null;
+  accessToken: string;
+  appSecret: string;
+  verifyTokenHash: string;
+  webhookKey: string;
+  status: string;
+};
+
+function requireCredentialClient() {
+  if (!supabaseService || !whatsappCredentialsKey) {
+    throw new Error("Faltan SUPABASE_SERVICE_ROLE_KEY / WHATSAPP_CREDENTIALS_KEY para leer credenciales WhatsApp.");
+  }
+  return { client: supabaseService, key: whatsappCredentialsKey };
+}
+
+// Cache en memoria de credenciales ya descifradas: sin esto, CADA mensaje
+// entrante paga un round-trip a Postgres con pgp_sym_decrypt. TTL corto para
+// que rotar un token o desactivar una integracion surta efecto en ~1 minuto
+// sin reiniciar el bot. Los errores NO se cachean (se reintenta al siguiente
+// mensaje); un resultado null si se cachea, para no martillar la BD con
+// numeros desconocidos.
+const CREDENTIALS_CACHE_TTL_MS = 60_000;
+const credentialsCache = new Map<string, { value: WhatsappIntegrationCredentials | null; expiresAt: number }>();
+
+async function cachedCredentials(
+  cacheKey: string,
+  load: () => Promise<WhatsappIntegrationCredentials | null>,
+): Promise<WhatsappIntegrationCredentials | null> {
+  const hit = credentialsCache.get(cacheKey);
+  if (hit && hit.expiresAt > Date.now()) return hit.value;
+  const value = await load();
+  credentialsCache.set(cacheKey, { value, expiresAt: Date.now() + CREDENTIALS_CACHE_TTL_MS });
+  return value;
+}
+
+export async function getWhatsappIntegration(integrationId: string): Promise<WhatsappIntegrationCredentials | null> {
+  return cachedCredentials(`id:${integrationId}`, async () => {
+    const { client, key } = requireCredentialClient();
+    const { data, error } = await client.rpc("bot_get_whatsapp_integration", {
+      p_integration_id: integrationId,
+      p_encryption_key: key,
+    });
+    if (error) throw error;
+    return (data as WhatsappIntegrationCredentials | null) ?? null;
+  });
+}
+
+export async function getWhatsappIntegrationByPhoneNumber(phoneNumberId: string): Promise<WhatsappIntegrationCredentials | null> {
+  return cachedCredentials(`phone:${phoneNumberId}`, async () => {
+    const { client, key } = requireCredentialClient();
+    const { data, error } = await client.rpc("bot_get_whatsapp_integration_by_phone", {
+      p_phone_number_id: phoneNumberId,
+      p_encryption_key: key,
+    });
+    if (error) throw error;
+    return (data as WhatsappIntegrationCredentials | null) ?? null;
+  });
+}
 
 // Las 4 funciones bot_* son las mismas que usaba el flujo de n8n (ver
 // supabase/migrations/202606230001_*.sql y 202606230002_*.sql en el repo de

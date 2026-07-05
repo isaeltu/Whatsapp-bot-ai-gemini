@@ -1,19 +1,23 @@
-const apiVersion = process.env.META_API_VERSION || "v21.0";
+﻿const apiVersion = process.env.META_API_VERSION || "v21.0";
 const accessToken = process.env.META_WHATSAPP_ACCESS_TOKEN;
 
-if (!accessToken) {
-  throw new Error("Falta META_WHATSAPP_ACCESS_TOKEN en el .env");
+function resolveAccessToken(override?: string): string {
+  const token = override || accessToken;
+  if (!token) {
+    throw new Error("Falta META_WHATSAPP_ACCESS_TOKEN o accessToken de la integracion WhatsApp.");
+  }
+  return token;
 }
 
 // phoneNumberId identifica el numero de WhatsApp del NEGOCIO (no del bot como
 // proceso): llega en cada webhook entrante (value.metadata.phone_number_id),
 // asi que un mismo proceso puede atender varios restaurantes/numeros a la vez
 // si todos apuntan al mismo webhook.
-export async function sendWhatsAppText(phoneNumberId: string, to: string, body: string): Promise<void> {
+export async function sendWhatsAppText(phoneNumberId: string, to: string, body: string, tokenOverride?: string): Promise<void> {
   const res = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${resolveAccessToken(tokenOverride)}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -37,6 +41,7 @@ export async function uploadMedia(
   bytes: Uint8Array,
   mimeType: string,
   filename: string,
+  tokenOverride?: string,
 ): Promise<string> {
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
@@ -44,7 +49,7 @@ export async function uploadMedia(
 
   const res = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/media`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${resolveAccessToken(tokenOverride)}` },
     body: form,
   });
   if (!res.ok) {
@@ -64,11 +69,12 @@ export async function sendWhatsAppDocument(
   mediaId: string,
   filename: string,
   caption?: string,
+  tokenOverride?: string,
 ): Promise<void> {
   const res = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${resolveAccessToken(tokenOverride)}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -87,9 +93,10 @@ export async function sendWhatsAppDocument(
 // Las notas de voz llegan en el webhook solo como un media id; hay que
 // resolver la URL real (paso 1, expira rapido) y descargar el binario aparte
 // (paso 2), ambos pasos exigen el mismo access token.
-export async function downloadMedia(mediaId: string): Promise<{ mimeType: string; base64: string } | null> {
+export async function downloadMedia(mediaId: string, tokenOverride?: string): Promise<{ mimeType: string; base64: string } | null> {
+  const token = resolveAccessToken(tokenOverride);
   const metaRes = await fetch(`https://graph.facebook.com/${apiVersion}/${mediaId}`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!metaRes.ok) {
     console.warn(`No se pudo resolver la URL del media ${mediaId}: ${metaRes.status}`);
@@ -98,7 +105,7 @@ export async function downloadMedia(mediaId: string): Promise<{ mimeType: string
   const meta = (await metaRes.json()) as { url?: string; mime_type?: string };
   if (!meta.url) return null;
 
-  const fileRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const fileRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${token}` } });
   if (!fileRes.ok) {
     console.warn(`No se pudo descargar el media ${mediaId}: ${fileRes.status}`);
     return null;
