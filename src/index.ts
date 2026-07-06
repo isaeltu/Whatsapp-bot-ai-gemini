@@ -682,8 +682,21 @@ async function handleIncomingMessage(
 
   // --- Chat panel: registra conversacion y verifica si el bot esta pausado ---
   const conv = await botUpsertConversation(phoneNumberId, from).catch(() => null) as ConvInfo | null;
+
+  // Para notas de voz se pospone el guardado del mensaje entrante hasta tener
+  // la transcripcion de Gemini, asi el panel de chat muestra lo que el
+  // cliente DIJO en vez de "[nota de voz]". Si el flujo termina antes de
+  // llamar al LLM (bot pausado, identificacion, error), se guarda la
+  // etiqueta generica para no perder el mensaje.
+  let inboundSaved = false;
+  const saveInbound = (content: string) => {
+    if (!conv || inboundSaved) return;
+    inboundSaved = true;
+    botSaveMessage(conv.id, conv.restaurantId, "inbound", "customer", content).catch(() => {});
+  };
+
   if (conv) {
-    botSaveMessage(conv.id, conv.restaurantId, "inbound", "customer", messageLabel).catch(() => {});
+    if (incoming.kind === "text" || conv.botPaused) saveInbound(messageLabel);
     if (conv.botPaused) {
       console.log(`[chat] Conversacion ${from} en modo humano; mensaje guardado, IA no responde.`);
       return;
@@ -710,11 +723,25 @@ async function handleIncomingMessage(
   }
 
   const canContinue = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials);
-  if (!canContinue) return;
+  if (!canContinue) {
+    saveInbound(messageLabel);
+    return;
+  }
   const systemPrompt = buildSystemPrompt(menu, state);
 
   const llmResult = await interpretMessage(systemPrompt, incoming);
   const messageExcerpt = llmResult?.transcript || messageLabel;
+
+  // Nota de voz transcrita: se guarda el texto real en el chat y se corrige
+  // el historial del LLM para que los turnos siguientes sepan que dijo.
+  if (incoming.kind === "audio" && llmResult?.transcript) {
+    const transcriptText = `🎤 ${llmResult.transcript}`;
+    saveInbound(transcriptText);
+    const lastCustomerTurn = [...state.history].reverse().find((turn) => turn.role === "customer");
+    if (lastCustomerTurn && lastCustomerTurn.text === messageLabel) lastCustomerTurn.text = transcriptText;
+  } else {
+    saveInbound(messageLabel);
+  }
 
   if (!llmResult) {
     const shouldHandoff = recordFailedAttempt(state);
