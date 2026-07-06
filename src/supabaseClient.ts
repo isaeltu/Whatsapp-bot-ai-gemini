@@ -18,7 +18,62 @@ if (!supabaseUrl || !supabaseAnonKey) {
 }
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
-const supabaseService = supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey) : null;
+export const supabaseService = supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey) : null;
+
+// Deja constancia del ultimo error de envio de una integracion (visible en el
+// panel de Super Admin) sin desactivarla: el bot sigue intentando y el token
+// se puede corregir re-registrando el numero. Fire-and-forget.
+export function recordIntegrationSendError(phoneNumberId: string, message: string): void {
+  if (!supabaseService) return;
+  supabaseService
+    .from("whatsapp_integrations")
+    .update({ last_error: message.slice(0, 500) })
+    .eq("phone_number_id", phoneNumberId)
+    .then(({ error }) => {
+      if (error) console.warn("No se pudo registrar last_error de la integracion:", error.message);
+    });
+}
+
+// ── Analisis de conversaciones (fase 3, requiere service role) ───────────────
+
+function requireServiceClient() {
+  if (!supabaseService) {
+    throw new Error("Falta SUPABASE_SERVICE_ROLE_KEY para el analisis de conversaciones.");
+  }
+  return supabaseService;
+}
+
+export async function getConversationCorpus(restaurantId: string, days: number, limit: number): Promise<unknown[]> {
+  const { data, error } = await requireServiceClient().rpc("bot_get_conversation_corpus", {
+    p_restaurant_id: restaurantId,
+    p_days: days,
+    p_limit: limit,
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? data : [];
+}
+
+export async function getProductNames(restaurantId: string): Promise<string[]> {
+  const { data, error } = await requireServiceClient()
+    .from("products")
+    .select("name")
+    .eq("restaurant_id", restaurantId)
+    .eq("is_active", true);
+  if (error) throw error;
+  return ((data ?? []) as { name: string }[]).map((p) => p.name);
+}
+
+export async function insertBotSuggestions(
+  restaurantId: string,
+  suggestions: Array<{ kind?: string; title: string; suggestion: string; evidence: Record<string, unknown> }>,
+): Promise<number> {
+  const { data, error } = await requireServiceClient().rpc("bot_insert_suggestions", {
+    p_restaurant_id: restaurantId,
+    p_suggestions: suggestions,
+  });
+  if (error) throw error;
+  return typeof data === "number" ? data : 0;
+}
 
 export type WhatsappIntegrationCredentials = {
   id: string;

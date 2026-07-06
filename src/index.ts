@@ -38,6 +38,9 @@ import {
 } from "./memory";
 import { isRateLimited } from "./rateLimiter";
 import { downloadMedia, sendWhatsAppDocument, sendWhatsAppText, uploadMedia } from "./metaWhatsapp";
+import { logPlatformEvent, maskPhone } from "./logger";
+import { recordIntegrationSendError } from "./supabaseClient";
+import { analyzeRestaurantConversations } from "./insights";
 import { ConversationState, IncomingMessage, MenuSnapshot, OrderItem } from "./types";
 import { startEcfStatusPoller } from "./ecf/ecfPoller";
 
@@ -201,6 +204,32 @@ app.post("/internal/generate-ecf-credit-note", async (req, res) => {
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+// Fase 3 del bot inteligente: analiza las conversaciones recientes de un
+// restaurante y deja sugerencias 'pending' en bot_suggestions para que el
+// admin las apruebe desde Restpo. Lo dispara la Edge Function
+// analyze-bot-conversations (boton "Analizar conversaciones" del panel).
+// Header requerido: x-admin-token
+app.post("/internal/analyze-conversations", async (req, res) => {
+  const provided = req.header("x-admin-token");
+  if (!adminToken || provided !== adminToken) {
+    res.status(403).send("Forbidden");
+    return;
+  }
+  const restaurantId = (req.body ?? {}).restaurantId as string | undefined;
+  if (!restaurantId) {
+    res.status(400).json({ error: "Falta restaurantId." });
+    return;
+  }
+  try {
+    const result = await analyzeRestaurantConversations(restaurantId);
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logPlatformEvent("error", "bot.analysis_failed", `Fallo el analisis de conversaciones: ${message.slice(0, 300)}`, restaurantId);
+    res.status(500).json({ error: message });
   }
 });
 
@@ -389,6 +418,9 @@ app.post("/webhook/meta/:integrationId", async (req, res) => {
   }
 
   if (!credentials) {
+    logPlatformEvent("warn", "webhook.integration_not_found", `Webhook POST para integracion desconocida o inactiva: ${req.params.integrationId}.`, null, {
+      integrationId: req.params.integrationId,
+    });
     res.sendStatus(404);
     return;
   }
@@ -396,7 +428,9 @@ app.post("/webhook/meta/:integrationId", async (req, res) => {
   res.sendStatus(200);
 
   if (!isValidSignature(req, credentials.appSecret)) {
-    console.warn(`[diagnostico] Firma invalida para integracion ${req.params.integrationId}; payload ignorado.`);
+    logPlatformEvent("warn", "webhook.invalid_signature", `Firma X-Hub-Signature-256 invalida para la integracion ${req.params.integrationId}; payload ignorado (posible app secret desactualizado o request falso).`, credentials.restaurantId ?? null, {
+      integrationId: req.params.integrationId,
+    });
     return;
   }
 
@@ -636,7 +670,13 @@ async function handleIncomingMessage(
 ): Promise<void> {
   const menu = await getMenu(phoneNumberId);
   if (!menu) {
-    console.warn(`Bot de WhatsApp deshabilitado para el numero ${phoneNumberId}; mensaje ignorado.`);
+    logPlatformEvent(
+      "warn",
+      "bot.menu_unresolved",
+      `Mensaje ignorado: no se resolvio menu/restaurante para el numero ${phoneNumberId} (bot deshabilitado o numero sin registrar).`,
+      null,
+      { phoneNumberId, from: maskPhone(from) },
+    );
     return;
   }
 
@@ -678,9 +718,13 @@ async function handleIncomingMessage(
 
   if (!llmResult) {
     const shouldHandoff = recordFailedAttempt(state);
+    // La respuesta de "no entendi" es configurable por el admin del
+    // restaurante (fallback_message); el texto de handoff se mantiene fijo
+    // porque describe una accion del sistema, no estilo.
+    const configuredFallback = menu.botConfig?.fallbackMessage?.trim();
     const replyText = shouldHandoff
       ? "Disculpa, no logro entender bien tu pedido. Ya avise a alguien del negocio para que te atienda en breve."
-      : "Disculpa, no entendi bien eso. Puedes repetir tu pedido con mas detalle?";
+      : configuredFallback || "Disculpa, no entendi bien eso. Puedes repetir tu pedido con mas detalle?";
 
     recordBotMessage(state, replyText);
     await saveState(phoneNumberId, from, state);
@@ -776,6 +820,12 @@ async function handleOrderIntent(
     await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
+
+  logPlatformEvent("info", "bot.order_created", `Pedido ${order.orderNumber} creado por el bot (total RD$ ${order.total}).`, menu.restaurant.id, {
+    orderNumber: order.orderNumber,
+    total: order.total,
+    customer: maskPhone(from),
+  });
 
   const notificationEmail = order.notificationEmail || menu.restaurant.notificationEmail;
   if (notificationEmail) {
@@ -882,6 +932,14 @@ async function safeReply(
   try {
     await sendWhatsAppText(phoneNumberId, to, text, credentials?.accessToken);
   } catch (err) {
-    console.error("Fallo al enviar mensaje de WhatsApp:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    // El cliente NO recibio la respuesta: deja rastro en el panel de logs y
+    // en la integracion (last_error) para que el operador lo vea de inmediato
+    // (caso tipico: token de Meta vencido -> 401).
+    logPlatformEvent("error", "whatsapp.send_failed", `Fallo el envio de WhatsApp: ${message.slice(0, 300)}`, null, {
+      phoneNumberId,
+      to: maskPhone(to),
+    });
+    recordIntegrationSendError(phoneNumberId, message);
   }
 }

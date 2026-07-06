@@ -21,12 +21,34 @@ export type Product = {
   name: string;
   description: string | null;
   price: number;
+  tags?: string[];
+};
+
+// Configuracion estructurada del bot definida por el admin del restaurante
+// (restaurant_bot_settings). Todo opcional porque el RPC viejo (antes de la
+// migracion 202607060001_bot_intelligence) no devuelve estos campos.
+export type BotConfig = {
+  tone?: string;                    // amigable | formal | experto | casual | vendedor | familiar
+  recommendationLevel?: string;     // basico | vendedor | experto
+  welcomeMessage?: string;
+  fallbackMessage?: string;
+  customRules?: string;
+  signaturePhrases?: string;
+  avoidTopics?: string;
+  unavailableProductRule?: string;
+  allowDrinkSuggestions?: boolean;
+  allowComboSuggestions?: boolean;
+  allowHistorySuggestions?: boolean;
 };
 
 export type MenuSnapshot = {
   restaurant: RestaurantInfo;
   categories: Category[];
   products: Product[];
+  botConfig?: BotConfig | null;
+  unavailableProducts?: string[];   // existen pero hoy no estan disponibles
+  popularProductIds?: string[];     // top ventas reales de los ultimos 60 dias
+  approvedInsights?: string[];      // sugerencias aprendidas YA aprobadas por el admin
 };
 
 export type ConversationTurn = {
