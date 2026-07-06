@@ -1,43 +1,48 @@
 import { redis } from "./redisClient";
-import { ConversationState } from "./types";
+import { ConversationState, CustomerLookupResult } from "./types";
 
-// Memoria de conversacion por numero de telefono. Antes vivia en un Map en
-// RAM del proceso (se perdia en cada reinicio); ahora vive en Redis
-// (Upstash), asi que sobrevive reinicios/redeploys del bot.
-//
-// Para minimizar llamadas a Redis, el patron es: 1 GET al inicio de cada
-// mensaje (getState), mutaciones puras y sincronas en memoria sobre ese
-// objeto (las funciones de abajo), y 1 SET al final (saveState). Nunca se
-// hace una llamada a Redis por cada mutacion individual.
-
+// Memoria de conversacion por numero del restaurante + numero del cliente.
+// El mismo WhatsApp puede hablar con restaurantes distintos sin mezclar estado.
 const MAX_TURNS = 12;
 const HANDOFF_AFTER_FAILED_ATTEMPTS = 3;
-// Si una conversacion queda inactiva por mas de esto, se "olvida" sola
-// (libera espacio en Redis); un cliente que vuelve despues de eso simplemente
-// empieza una conversacion nueva, igual que si el proceso se hubiera reiniciado.
 const STATE_TTL_SECONDS = 60 * 60 * 6;
 
-function keyFor(phone: string): string {
-  return `wa-bot:conversation:${phone}`;
+function keyFor(phoneNumberId: string, phone: string): string {
+  return `wa-bot:conversation:${phoneNumberId}:${phone}`;
 }
 
-function emptyState(): ConversationState {
+function emptyState(customerPhone = ""): ConversationState {
   return {
+    stage: "CHECK_CUSTOMER",
     history: [],
     failedAttempts: 0,
-    profile: { name: "", email: "" },
+    profile: { customerId: "", phone: customerPhone, name: "", email: "" },
     deliveryType: "",
     deliveryAddress: "",
   };
 }
 
-export async function getState(phone: string): Promise<ConversationState> {
-  const stored = await redis.get<ConversationState>(keyFor(phone));
-  return stored ?? emptyState();
+function normalizeState(state: ConversationState | null, customerPhone: string): ConversationState {
+  const base = state ?? emptyState(customerPhone);
+  return {
+    ...base,
+    stage: base.stage || "CHECK_CUSTOMER",
+    profile: {
+      customerId: base.profile?.customerId || "",
+      phone: base.profile?.phone || customerPhone,
+      name: base.profile?.name || "",
+      email: base.profile?.email || "",
+    },
+  };
 }
 
-export async function saveState(phone: string, state: ConversationState): Promise<void> {
-  await redis.set(keyFor(phone), state, { ex: STATE_TTL_SECONDS });
+export async function getState(phoneNumberId: string, phone: string): Promise<ConversationState> {
+  const stored = await redis.get<ConversationState>(keyFor(phoneNumberId, phone));
+  return normalizeState(stored ?? null, phone);
+}
+
+export async function saveState(phoneNumberId: string, phone: string, state: ConversationState): Promise<void> {
+  await redis.set(keyFor(phoneNumberId, phone), state, { ex: STATE_TTL_SECONDS });
 }
 
 export function recordCustomerMessage(state: ConversationState, text: string): void {
@@ -59,8 +64,23 @@ export function resetFailedAttempts(state: ConversationState): void {
   state.failedAttempts = 0;
 }
 
+export function setCustomerProfile(state: ConversationState, customer: CustomerLookupResult): void {
+  state.profile = {
+    customerId: customer.customerId,
+    phone: customer.phone || state.profile.phone,
+    name: customer.fullName || state.profile.name,
+    email: customer.email || state.profile.email,
+  };
+  state.stage = customer.missingName
+    ? "ASK_CUSTOMER_NAME"
+    : customer.missingEmail
+      ? "ASK_CUSTOMER_EMAIL"
+      : "CUSTOMER_IDENTIFIED";
+}
+
 export function updateProfile(state: ConversationState, name: string, email: string): void {
   state.profile = {
+    ...state.profile,
     name: name.trim() || state.profile.name,
     email: email.trim() || state.profile.email,
   };

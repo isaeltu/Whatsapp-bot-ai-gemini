@@ -35,7 +35,18 @@ export type ConversationTurn = {
   at: string;
 };
 
+export type CustomerFlowStage =
+  | "CHECK_CUSTOMER"
+  | "ASK_CUSTOMER_NAME"
+  | "ASK_CUSTOMER_EMAIL"
+  | "CUSTOMER_IDENTIFIED"
+  | "ORDER_PRODUCTS"
+  | "PAYMENT_METHOD"
+  | "CONFIRM_ORDER";
+
 export type CustomerProfile = {
+  customerId: string;
+  phone: string;
   name: string;
   email: string;
 };
@@ -43,6 +54,7 @@ export type CustomerProfile = {
 export type DeliveryType = "" | "pickup" | "delivery";
 
 export type ConversationState = {
+  stage: CustomerFlowStage;
   history: ConversationTurn[];
   failedAttempts: number;
   profile: CustomerProfile;
@@ -86,8 +98,13 @@ export type CreatePaymentLinkResult = {
   total: number;
 };
 
-export type UpsertCustomerResult = {
+export type CustomerLookupResult = {
   customerId: string;
   fullName: string;
   email: string;
+  phone: string;
+  missingName: boolean;
+  missingEmail: boolean;
 };
+
+export type UpsertCustomerResult = CustomerLookupResult;

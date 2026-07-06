@@ -13,6 +13,7 @@ import {
   createHandoff,
   createOrder,
   createPaymentLink,
+  getCustomerByPhone,
   getMenu,
   getOrderInvoicePdf,
   getPaymentLinkForCharge,
@@ -31,12 +32,13 @@ import {
   recordFailedAttempt,
   resetFailedAttempts,
   saveState,
+  setCustomerProfile,
   updateDelivery,
   updateProfile,
 } from "./memory";
 import { isRateLimited } from "./rateLimiter";
 import { downloadMedia, sendWhatsAppDocument, sendWhatsAppText, uploadMedia } from "./metaWhatsapp";
-import { IncomingMessage, MenuSnapshot, OrderItem } from "./types";
+import { ConversationState, IncomingMessage, MenuSnapshot, OrderItem } from "./types";
 import { startEcfStatusPoller } from "./ecf/ecfPoller";
 
 console.log(
@@ -54,7 +56,7 @@ if (!verifyToken) {
 if (!appSecret) {
   console.warn(
     "META_APP_SECRET no esta configurado: NO se valida la firma de los webhooks entrantes. " +
-      "Configuralo antes de produccion (ver .env.example).",
+      "Configuralo antes de producción (ver .env.example).",
   );
 }
 if (!process.env.SUPABASE_SERVICE_ROLE_KEY || !process.env.WHATSAPP_CREDENTIALS_KEY) {
@@ -238,9 +240,9 @@ async function notifyCardPaymentConfirmed(
     totalText ? ` (${totalText})` : ""
   }. Gracias por tu compra.`;
   const credentials = await resolveCredentialsForPhone(phoneNumberId);
-  const state = await getState(to);
+  const state = await getState(phoneNumberId, to);
   recordBotMessage(state, replyText);
-  await saveState(to, state);
+  await saveState(phoneNumberId, to, state);
   await safeReply(phoneNumberId, to, replyText, credentials);
   await safeSendInvoice(phoneNumberId, to, orderId, credentials);
 }
@@ -508,6 +510,123 @@ const HUMAN_KEYWORDS = [
   "necesito ayuda de verdad", "no me entiende",
 ];
 
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const ORDER_HINTS = [
+  "pedir", "pedido", "ordenar", "orden", "comprar", "quiero", "dame",
+  "mandame", "envia", "delivery", "recoger", "pickup", "pagar", "tarjeta", "efectivo",
+];
+
+function textFromIncoming(incoming: IncomingMessage): string {
+  return incoming.kind === "text" ? incoming.text.trim() : "";
+}
+
+function looksLikeOrderRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return ORDER_HINTS.some((hint) => normalized.includes(hint));
+}
+
+async function replyAndStore(
+  phoneNumberId: string,
+  from: string,
+  state: ConversationState,
+  replyText: string,
+  conv: ConvInfo | null,
+  credentials?: RuntimeWhatsAppCredentials | null,
+): Promise<void> {
+  recordBotMessage(state, replyText);
+  await saveState(phoneNumberId, from, state);
+  await safeReply(phoneNumberId, from, replyText, credentials);
+  if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
+}
+
+async function ensureCustomerIdentified(
+  phoneNumberId: string,
+  from: string,
+  incoming: IncomingMessage,
+  state: ConversationState,
+  conv: ConvInfo | null,
+  credentials?: RuntimeWhatsAppCredentials | null,
+  force = false,
+): Promise<boolean> {
+  const incomingText = textFromIncoming(incoming);
+
+  if (state.stage === "ASK_CUSTOMER_NAME") {
+    if (!incomingText || incomingText.length < 2 || EMAIL_RE.test(incomingText)) {
+      await replyAndStore(phoneNumberId, from, state, "Para registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
+      return false;
+    }
+
+    state.profile.name = incomingText;
+    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
+    if (customer) setCustomerProfile(state, customer);
+
+    if (!state.profile.email) {
+      state.stage = "ASK_CUSTOMER_EMAIL";
+      await replyAndStore(phoneNumberId, from, state, `Gracias, ${state.profile.name}. Ahora dime tu correo electronico.`, conv, credentials);
+      return false;
+    }
+
+    state.stage = "CUSTOMER_IDENTIFIED";
+    await replyAndStore(phoneNumberId, from, state, `Gracias, ${state.profile.name}. Que deseas ordenar hoy?`, conv, credentials);
+    return false;
+  }
+
+  if (state.stage === "ASK_CUSTOMER_EMAIL") {
+    if (!incomingText || !EMAIL_RE.test(incomingText)) {
+      await replyAndStore(phoneNumberId, from, state, "Necesito un correo electronico valido para registrar tu pedido.", conv, credentials);
+      return false;
+    }
+
+    state.profile.email = incomingText.toLowerCase();
+    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
+    if (!customer) {
+      await replyAndStore(phoneNumberId, from, state, "No pude registrar tus datos. Puedes intentar con otro correo electronico?", conv, credentials);
+      return false;
+    }
+
+    setCustomerProfile(state, customer);
+    await replyAndStore(phoneNumberId, from, state, `Listo, ${state.profile.name}. Que deseas ordenar hoy?`, conv, credentials);
+    return false;
+  }
+
+  if (state.profile.customerId && state.profile.name && state.profile.email) {
+    state.stage = "CUSTOMER_IDENTIFIED";
+    return true;
+  }
+
+  if (force && state.profile.name && state.profile.email) {
+    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
+    if (customer) {
+      setCustomerProfile(state, customer);
+      return true;
+    }
+  }
+
+  const customer = await getCustomerByPhone(phoneNumberId, from);
+  if (customer) {
+    setCustomerProfile(state, customer);
+    if (!force && !looksLikeOrderRequest(incomingText)) return true;
+
+    if (customer.missingName) {
+      state.stage = "ASK_CUSTOMER_NAME";
+      await replyAndStore(phoneNumberId, from, state, "Antes de registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
+      return false;
+    }
+    if (customer.missingEmail) {
+      state.stage = "ASK_CUSTOMER_EMAIL";
+      await replyAndStore(phoneNumberId, from, state, `Hola ${state.profile.name || "!"}. Para registrar tu pedido, dime tu correo electronico.`, conv, credentials);
+      return false;
+    }
+    return true;
+  }
+
+  if (!force && !looksLikeOrderRequest(incomingText)) return true;
+
+  state.profile.phone = from;
+  state.stage = "ASK_CUSTOMER_NAME";
+  await replyAndStore(phoneNumberId, from, state, "Antes de iniciar tu primer pedido, dime tu nombre completo por favor.", conv, credentials);
+  return false;
+}
 async function handleIncomingMessage(
   phoneNumberId: string,
   from: string,
@@ -531,15 +650,17 @@ async function handleIncomingMessage(
     }
   }
 
+  const state = await getState(phoneNumberId, from);
+  recordCustomerMessage(state, messageLabel);
+
   // Deteccion explicita de solicitud de humano (antes de llamar a Gemini)
   if (
     incoming.kind === "text" &&
     HUMAN_KEYWORDS.some((k) => incoming.text.toLowerCase().includes(k))
   ) {
-    const replyText = "Entendido! Te conecto con uno de nuestros agentes. En un momento te atienden. 👋";
-    const state = await getState(from);
+    const replyText = "Entendido! Te conecto con uno de nuestros agentes. En un momento te atienden.";
     recordBotMessage(state, replyText);
-    await saveState(from, state);
+    await saveState(phoneNumberId, from, state);
     if (conv) {
       await botPauseConversation(conv.id, "Cliente solicito atencion humana").catch(() => {});
       botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
@@ -547,10 +668,9 @@ async function handleIncomingMessage(
     await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
-  // --------------------------------------------------------------------------
 
-  const state = await getState(from);
-  recordCustomerMessage(state, messageLabel);
+  const canContinue = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials);
+  if (!canContinue) return;
   const systemPrompt = buildSystemPrompt(menu, state);
 
   const llmResult = await interpretMessage(systemPrompt, incoming);
@@ -563,7 +683,7 @@ async function handleIncomingMessage(
       : "Disculpa, no entendi bien eso. Puedes repetir tu pedido con mas detalle?";
 
     recordBotMessage(state, replyText);
-    await saveState(from, state);
+    await saveState(phoneNumberId, from, state);
     if (shouldHandoff) {
       await createHandoff(phoneNumberId, from, state.profile.name, "no_entendido", messageExcerpt);
       if (conv) await botPauseConversation(conv.id, "no_entendido").catch(() => {});
@@ -579,18 +699,26 @@ async function handleIncomingMessage(
   updateProfile(state, llmResult.customerName, llmResult.customerEmail);
   updateDelivery(state, llmResult.deliveryType, llmResult.deliveryAddress);
   recordBotMessage(state, llmResult.replyText);
-  await saveState(from, state);
+  await saveState(phoneNumberId, from, state);
 
   const profile = state.profile;
 
   if (llmResult.intent === "order") {
-    await handleOrderIntent(phoneNumberId, from, profile.name, profile.email,
+    if (!profile.customerId || !profile.name || !profile.email) {
+      const identified = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials, true);
+      if (!identified) return;
+    }
+    await handleOrderIntent(phoneNumberId, from, state.profile.customerId, state.profile.name, state.profile.email,
       llmResult.items, menu, state.deliveryType, state.deliveryAddress, conv, credentials);
     return;
   }
 
   if (llmResult.intent === "card_payment") {
-    await handleCardPaymentIntent(phoneNumberId, from, profile.name, profile.email,
+    if (!profile.customerId || !profile.name || !profile.email) {
+      const identified = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials, true);
+      if (!identified) return;
+    }
+    await handleCardPaymentIntent(phoneNumberId, from, state.profile.name, state.profile.email,
       llmResult.items, state.deliveryType, state.deliveryAddress, conv, credentials);
     return;
   }
@@ -610,6 +738,7 @@ async function handleIncomingMessage(
 async function handleOrderIntent(
   phoneNumberId: string,
   from: string,
+  customerId: string,
   customerName: string,
   customerEmail: string,
   items: OrderItem[],
@@ -619,13 +748,12 @@ async function handleOrderIntent(
   conv: ConvInfo | null = null,
   credentials?: RuntimeWhatsAppCredentials | null,
 ): Promise<void> {
-  const customer = await upsertCustomer(phoneNumberId, customerName, customerEmail);
-  if (!customer) {
-    const replyText =
-      "No pude registrar tus datos de contacto. Puedes confirmarme de nuevo tu nombre completo y un correo electronico valido?";
-    const state = await getState(from);
+  if (!customerId || !customerName || !customerEmail) {
+    const replyText = "Antes de registrar tu pedido necesito completar tus datos de cliente.";
+    const state = await getState(phoneNumberId, from);
+    state.stage = !customerName ? "ASK_CUSTOMER_NAME" : "ASK_CUSTOMER_EMAIL";
     recordBotMessage(state, replyText);
-    await saveState(from, state);
+    await saveState(phoneNumberId, from, state);
     await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
@@ -635,16 +763,16 @@ async function handleOrderIntent(
     from,
     customerName,
     items,
-    customer.customerId,
+    customerId,
     deliveryType,
     deliveryAddress,
   );
   if (!order) {
     const replyText =
       "No pude registrar tu pedido tal como lo escribiste. Puedes confirmarme de nuevo, uno por uno, los productos y cantidades que deseas?";
-    const state = await getState(from);
+    const state = await getState(phoneNumberId, from);
     recordBotMessage(state, replyText);
-    await saveState(from, state);
+    await saveState(phoneNumberId, from, state);
     await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
@@ -682,9 +810,9 @@ async function handleOrderIntent(
     deliveryType === "delivery" ? `Entrega a domicilio: ${deliveryAddress}` : "Para retirar en el restaurante";
 
   const replyText = `Listo! Tu pedido ${order.orderNumber} quedo registrado:\n${itemLines}\n\n${deliveryLine}\nTotal: ${total}\n\nGracias por tu compra en ${menu.restaurant.name}.`;
-  const state = await getState(from);
+  const state = await getState(phoneNumberId, from);
   recordBotMessage(state, replyText);
-  await saveState(from, state);
+  await saveState(phoneNumberId, from, state);
   await safeReply(phoneNumberId, from, replyText, credentials);
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
   await safeSendInvoice(phoneNumberId, from, order.orderId, credentials);
@@ -725,9 +853,9 @@ async function handleCardPaymentIntent(
   if (!link) {
     const replyText =
       "No pude generar el link de pago. Puedes confirmarme de nuevo los productos y cantidades, o prefieres pagar en efectivo?";
-    const state = await getState(from);
+    const state = await getState(phoneNumberId, from);
     recordBotMessage(state, replyText);
-    await saveState(from, state);
+    await saveState(phoneNumberId, from, state);
     await safeReply(phoneNumberId, from, replyText, credentials);
     return;
   }
@@ -738,9 +866,9 @@ async function handleCardPaymentIntent(
     link.total,
   );
   const replyText = `Perfecto! Aqui esta tu link de pago seguro por ${total}:\n${payUrl}\n\nEn cuanto completes el pago te confirmo tu pedido aqui mismo.`;
-  const state = await getState(from);
+  const state = await getState(phoneNumberId, from);
   recordBotMessage(state, replyText);
-  await saveState(from, state);
+  await saveState(phoneNumberId, from, state);
   await safeReply(phoneNumberId, from, replyText, credentials);
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
 }

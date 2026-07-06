@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import {
   CreateOrderResult,
   CreatePaymentLinkResult,
+  CustomerLookupResult,
   MenuSnapshot,
   OrderItem,
   UpsertCustomerResult,
@@ -96,15 +97,32 @@ export async function getMenu(phoneNumberId: string): Promise<MenuSnapshot | nul
   return (data as MenuSnapshot | null) ?? null;
 }
 
+export async function getCustomerByPhone(
+  phoneNumberId: string,
+  customerPhone: string,
+): Promise<CustomerLookupResult | null> {
+  const { data, error } = await supabase.rpc("bot_get_customer_by_phone", {
+    p_phone_number_id: phoneNumberId,
+    p_customer_phone: customerPhone,
+  });
+  if (error) {
+    console.warn("bot_get_customer_by_phone fallo:", error.message);
+    return null;
+  }
+  return (data as CustomerLookupResult | null) ?? null;
+}
+
 export async function upsertCustomer(
   phoneNumberId: string,
+  customerPhone: string,
   fullName: string,
-  email: string
+  email: string,
 ): Promise<UpsertCustomerResult | null> {
   const { data, error } = await supabase.rpc("bot_upsert_customer", {
     p_phone_number_id: phoneNumberId,
-    p_full_name: fullName,
-    p_email: email,
+    p_customer_phone: customerPhone,
+    p_full_name: fullName || null,
+    p_email: email || null,
   });
   if (error) {
     console.warn("bot_upsert_customer fallo:", error.message);
