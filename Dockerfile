@@ -12,4 +12,7 @@ COPY . .
 RUN npm run build
 
 ENV NODE_ENV=production
+# En contenedor el proxy vive fuera, asi que hay que escuchar en todas las
+# interfaces (fuera de Docker el default del codigo es 127.0.0.1).
+ENV BIND_HOST=0.0.0.0
 CMD ["node", "dist/index.js"]

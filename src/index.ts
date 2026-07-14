@@ -467,8 +467,11 @@ app.post("/webhook", (req, res) => {
   });
 });
 
-app.listen(port, () => {
-  console.log(`Bot escuchando en puerto ${port}`);
+// Solo localhost: todo el trafico entra por el reverse proxy (Caddy). Se
+// puede abrir con BIND_HOST=0.0.0.0 (p. ej. en Docker/Railway).
+const bindHost = process.env.BIND_HOST || "127.0.0.1";
+app.listen(port, bindHost, () => {
+  console.log(`Bot escuchando en ${bindHost}:${port}`);
   startEcfStatusPoller();
 });
 
