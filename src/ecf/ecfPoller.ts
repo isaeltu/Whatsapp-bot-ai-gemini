@@ -1,5 +1,6 @@
 import ECF, { P12Reader, ENVIRONMENT } from 'dgii-ecf';
 import { supabase } from '../supabaseClient';
+import { getEcfCertificate } from './ecfService';
 
 interface PendingRecord {
   id: string;
@@ -9,8 +10,6 @@ interface PendingRecord {
 }
 
 interface EcfSettingsRow {
-  p12_base64: string;
-  p12_passphrase: string;
   environment: 'test' | 'production';
 }
 
@@ -37,16 +36,20 @@ async function checkAndUpdateStatuses(): Promise<void> {
     try {
       const { data: settings } = await supabase
         .from('restaurant_ecf_settings')
-        .select('p12_base64, p12_passphrase, environment')
+        .select('environment')
         .eq('restaurant_id', restaurantId)
         .eq('is_enabled', true)
         .single();
 
       if (!settings) continue;
 
+      // El certificado esta cifrado en reposo: se obtiene descifrado via RPC.
+      const cert = await getEcfCertificate(restaurantId);
+      if (!cert) continue;
+
       const cfg = settings as EcfSettingsRow;
-      const p12Reader = new P12Reader(cfg.p12_passphrase);
-      const p12Data = p12Reader.getKeyFromStringBase64(cfg.p12_base64);
+      const p12Reader = new P12Reader(cert.passphrase);
+      const p12Data = p12Reader.getKeyFromStringBase64(cert.p12Base64);
       const env = cfg.environment === 'production' ? ENVIRONMENT.PROD : ENVIRONMENT.DEV;
       const ecfClient = new ECF(p12Data, env);
       await ecfClient.authenticate();

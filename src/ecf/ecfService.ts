@@ -118,6 +118,27 @@ function formaPagoCode(method: string): number {
   }
 }
 
+// El certificado ya no vive en columnas legibles: esta cifrado en reposo y
+// solo se obtiene descifrado via RPC (service_role) con la clave de la
+// plataforma. Exportado para que el poller lo reutilice.
+export async function getEcfCertificate(
+  restaurantId: string
+): Promise<{ p12Base64: string; passphrase: string } | null> {
+  const key = process.env.WHATSAPP_CREDENTIALS_KEY;
+  if (!key) {
+    console.error('[eCF] WHATSAPP_CREDENTIALS_KEY no configurada: no se puede leer el certificado');
+    return null;
+  }
+  const { data, error } = await supabase.rpc('ecf_get_certificate', {
+    p_restaurant_id: restaurantId,
+    p_encryption_key: key,
+  });
+  if (error || !data) return null;
+  const cert = data as { p12Base64?: string; passphrase?: string };
+  if (!cert.p12Base64) return null;
+  return { p12Base64: cert.p12Base64, passphrase: cert.passphrase ?? '' };
+}
+
 async function getEcfSettings(restaurantId: string): Promise<RestaurantEcfSettings | null> {
   const { data, error } = await supabase
     .from('restaurant_ecf_settings')
@@ -127,7 +148,15 @@ async function getEcfSettings(restaurantId: string): Promise<RestaurantEcfSettin
     .single();
 
   if (error || !data) return null;
-  return data as RestaurantEcfSettings;
+
+  const cert = await getEcfCertificate(restaurantId);
+  if (!cert) return null; // sin certificado no hay nada que firmar
+
+  return {
+    ...(data as Omit<RestaurantEcfSettings, 'p12_base64' | 'p12_passphrase'>),
+    p12_base64: cert.p12Base64,
+    p12_passphrase: cert.passphrase,
+  } as RestaurantEcfSettings;
 }
 
 async function incrementEncfSequence(
