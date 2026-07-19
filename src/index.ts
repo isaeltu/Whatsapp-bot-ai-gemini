@@ -131,6 +131,12 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, paused: isPaused });
 });
 
+// Healthcheck publico para monitoreo externo (UptimeRobot). Sin datos
+// sensibles: solo confirma que el proceso responde.
+app.get("/up", (_req, res) => {
+  res.status(200).send("ok");
+});
+
 // Panel simple para pausar/reanudar el bot con un click, sin redeploy.
 app.get("/control", (req, res) => {
   if (!requireAdminToken(req, res)) return;
