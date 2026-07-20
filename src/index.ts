@@ -604,13 +604,22 @@ async function resolveCustomer(
   state: ConversationState,
 ): Promise<boolean> {
   if (state.profile.customerId && state.profile.name) return true;
-  const customer = await getCustomerByPhone(phoneNumberId, from);
-  if (customer) {
-    setCustomerProfile(state, customer);
-    if (!customer.missingName) return true;
+  const existing = await getCustomerByPhone(phoneNumberId, from);
+  if (existing) {
+    setCustomerProfile(state, existing);
+    if (!existing.missingName) return true;
+  }
+  // Si ya tenemos el nombre (lo dio el LLM en la conversacion) pero aun no
+  // hay customerId, se crea/actualiza el cliente para poder crear la orden.
+  if (state.profile.name) {
+    const created = await upsertCustomer(phoneNumberId, from, state.profile.name, "");
+    if (created) {
+      setCustomerProfile(state, created);
+      return true;
+    }
   }
   state.profile.phone = from;
-  return Boolean(state.profile.name);
+  return false;
 }
 
 async function handleIncomingMessage(
