@@ -71,11 +71,8 @@ export function setCustomerProfile(state: ConversationState, customer: CustomerL
     name: customer.fullName || state.profile.name,
     email: customer.email || state.profile.email,
   };
-  state.stage = customer.missingName
-    ? "ASK_CUSTOMER_NAME"
-    : customer.missingEmail
-      ? "ASK_CUSTOMER_EMAIL"
-      : "CUSTOMER_IDENTIFIED";
+  // Solo se exige el nombre; el correo ya no se pide.
+  state.stage = customer.missingName ? "ASK_CUSTOMER_NAME" : "CUSTOMER_IDENTIFIED";
 }
 
 export function updateProfile(state: ConversationState, name: string, email: string): void {

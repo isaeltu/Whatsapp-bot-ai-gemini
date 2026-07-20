@@ -82,6 +82,9 @@ export type ConversationState = {
   profile: CustomerProfile;
   deliveryType: DeliveryType;
   deliveryAddress: string;
+  // Pedido que quedo en espera mientras se pide el nombre del cliente; se
+  // procesa apenas se captura el nombre para no perder lo que ya pidio.
+  pendingOrder?: { kind: "order" | "card"; items: OrderItem[]; deliveryType: DeliveryType; deliveryAddress: string } | null;
 };
 
 export type OrderItem = {

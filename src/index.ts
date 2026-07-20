@@ -491,6 +491,7 @@ type MetaWebhookBody = {
           type: string;
           text?: { body?: string };
           audio?: { id?: string };
+          location?: { latitude?: number; longitude?: number; name?: string; address?: string };
         }>;
       };
     }>;
@@ -534,8 +535,21 @@ async function handleWebhookPayload(body: MetaWebhookBody, credentials?: Runtime
     }
     incoming = { kind: "audio", mimeType: media.mimeType, data: media.base64 };
     messageLabel = "[nota de voz]";
+  } else if (message.type === "location" && message.location) {
+    // Ubicacion compartida por WhatsApp (para delivery). Se arma una linea de
+    // direccion + link a Google Maps; entra como texto para que el flujo de
+    // pedido la use como direccion y el panel de chat la muestre como pin.
+    const loc = message.location;
+    const lat = loc.latitude;
+    const lng = loc.longitude;
+    if (typeof lat !== "number" || typeof lng !== "number") return;
+    const label = [loc.name, loc.address].filter(Boolean).join(", ").trim();
+    const mapsUrl = `https://maps.google.com/?q=${lat},${lng}`;
+    const addressText = label || `Ubicacion compartida (${lat}, ${lng})`;
+    incoming = { kind: "text", text: `Mi direccion para el delivery: ${addressText}. Mapa: ${mapsUrl}` };
+    messageLabel = `📍 ${addressText} — ${mapsUrl}`;
   } else {
-    // Imagenes, stickers, ubicacion, etc. se ignoran en v1.
+    // Imagenes, stickers, etc. se ignoran en v1.
     return;
   }
 
@@ -582,94 +596,23 @@ async function replyAndStore(
   if (conv) botSaveMessage(conv.id, conv.restaurantId, "outbound", "bot", replyText).catch(() => {});
 }
 
-async function ensureCustomerIdentified(
+// Resuelve al cliente por telefono (solo nombre; el correo ya no se pide).
+// Deja el perfil listo si existe y devuelve true cuando ya hay nombre.
+async function resolveCustomer(
   phoneNumberId: string,
   from: string,
-  incoming: IncomingMessage,
   state: ConversationState,
-  conv: ConvInfo | null,
-  credentials?: RuntimeWhatsAppCredentials | null,
-  force = false,
 ): Promise<boolean> {
-  const incomingText = textFromIncoming(incoming);
-
-  if (state.stage === "ASK_CUSTOMER_NAME") {
-    if (!incomingText || incomingText.length < 2 || EMAIL_RE.test(incomingText)) {
-      await replyAndStore(phoneNumberId, from, state, "Para registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
-      return false;
-    }
-
-    state.profile.name = incomingText;
-    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
-    if (customer) setCustomerProfile(state, customer);
-
-    if (!state.profile.email) {
-      state.stage = "ASK_CUSTOMER_EMAIL";
-      await replyAndStore(phoneNumberId, from, state, `Gracias, ${state.profile.name}. Ahora dime tu correo electronico.`, conv, credentials);
-      return false;
-    }
-
-    state.stage = "CUSTOMER_IDENTIFIED";
-    await replyAndStore(phoneNumberId, from, state, `Gracias, ${state.profile.name}. Que deseas ordenar hoy?`, conv, credentials);
-    return false;
-  }
-
-  if (state.stage === "ASK_CUSTOMER_EMAIL") {
-    if (!incomingText || !EMAIL_RE.test(incomingText)) {
-      await replyAndStore(phoneNumberId, from, state, "Necesito un correo electronico valido para registrar tu pedido.", conv, credentials);
-      return false;
-    }
-
-    state.profile.email = incomingText.toLowerCase();
-    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
-    if (!customer) {
-      await replyAndStore(phoneNumberId, from, state, "No pude registrar tus datos. Puedes intentar con otro correo electronico?", conv, credentials);
-      return false;
-    }
-
-    setCustomerProfile(state, customer);
-    await replyAndStore(phoneNumberId, from, state, `Listo, ${state.profile.name}. Que deseas ordenar hoy?`, conv, credentials);
-    return false;
-  }
-
-  if (state.profile.customerId && state.profile.name && state.profile.email) {
-    state.stage = "CUSTOMER_IDENTIFIED";
-    return true;
-  }
-
-  if (force && state.profile.name && state.profile.email) {
-    const customer = await upsertCustomer(phoneNumberId, from, state.profile.name, state.profile.email);
-    if (customer) {
-      setCustomerProfile(state, customer);
-      return true;
-    }
-  }
-
+  if (state.profile.customerId && state.profile.name) return true;
   const customer = await getCustomerByPhone(phoneNumberId, from);
   if (customer) {
     setCustomerProfile(state, customer);
-    if (!force && !looksLikeOrderRequest(incomingText)) return true;
-
-    if (customer.missingName) {
-      state.stage = "ASK_CUSTOMER_NAME";
-      await replyAndStore(phoneNumberId, from, state, "Antes de registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
-      return false;
-    }
-    if (customer.missingEmail) {
-      state.stage = "ASK_CUSTOMER_EMAIL";
-      await replyAndStore(phoneNumberId, from, state, `Hola ${state.profile.name || "!"}. Para registrar tu pedido, dime tu correo electronico.`, conv, credentials);
-      return false;
-    }
-    return true;
+    if (!customer.missingName) return true;
   }
-
-  if (!force && !looksLikeOrderRequest(incomingText)) return true;
-
   state.profile.phone = from;
-  state.stage = "ASK_CUSTOMER_NAME";
-  await replyAndStore(phoneNumberId, from, state, "Antes de iniciar tu primer pedido, dime tu nombre completo por favor.", conv, credentials);
-  return false;
+  return Boolean(state.profile.name);
 }
+
 async function handleIncomingMessage(
   phoneNumberId: string,
   from: string,
@@ -731,18 +674,15 @@ async function handleIncomingMessage(
     return;
   }
 
-  const canContinue = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials);
-  if (!canContinue) {
-    saveInbound(messageLabel);
-    return;
-  }
+  // El LLM corre PRIMERO (incluso durante la captura de nombre) para tener la
+  // transcripcion de la voz y el nombre disponibles antes de decidir nada.
   const systemPrompt = buildSystemPrompt(menu, state);
-
   const llmResult = await interpretMessage(systemPrompt, incoming);
   const messageExcerpt = llmResult?.transcript || messageLabel;
 
   // Nota de voz transcrita: se guarda el texto real en el chat y se corrige
-  // el historial del LLM para que los turnos siguientes sepan que dijo.
+  // el historial. Se hace ANTES de la captura para que un nombre dicho por
+  // voz tambien se entienda.
   if (incoming.kind === "audio" && llmResult?.transcript) {
     const transcriptText = `🎤 ${llmResult.transcript}`;
     saveInbound(transcriptText);
@@ -750,6 +690,38 @@ async function handleIncomingMessage(
     if (lastCustomerTurn && lastCustomerTurn.text === messageLabel) lastCustomerTurn.text = transcriptText;
   } else {
     saveInbound(messageLabel);
+  }
+
+  const effectiveText = incoming.kind === "text" ? incoming.text.trim() : (llmResult?.transcript?.trim() || "");
+
+  // Nombre capturado por el LLM (texto natural o voz) apenas llega.
+  if (llmResult?.customerName) updateProfile(state, llmResult.customerName, "");
+
+  // --- Captura de nombre en curso (unico dato que se pide; el correo ya no) ---
+  if (state.stage === "ASK_CUSTOMER_NAME") {
+    const name = llmResult?.customerName?.trim() || effectiveText;
+    if (!name || name.length < 2 || EMAIL_RE.test(name)) {
+      await replyAndStore(phoneNumberId, from, state, "Para registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
+      return;
+    }
+    state.profile.name = name;
+    const customer = await upsertCustomer(phoneNumberId, from, name, "");
+    if (customer) setCustomerProfile(state, customer);
+    state.stage = "CUSTOMER_IDENTIFIED";
+    // Retomar el pedido que quedo en espera antes de pedir el nombre.
+    if (state.pendingOrder && state.pendingOrder.items.length) {
+      const po = state.pendingOrder;
+      state.pendingOrder = null;
+      await saveState(phoneNumberId, from, state);
+      if (po.kind === "card") {
+        await handleCardPaymentIntent(phoneNumberId, from, state.profile.name, state.profile.email, po.items, po.deliveryType, po.deliveryAddress, conv, credentials);
+      } else {
+        await handleOrderIntent(phoneNumberId, from, state.profile.customerId, state.profile.name, state.profile.email, po.items, menu, po.deliveryType, po.deliveryAddress, conv, credentials);
+      }
+      return;
+    }
+    await replyAndStore(phoneNumberId, from, state, `Gracias, ${name}. Que deseas ordenar hoy?`, conv, credentials);
+    return;
   }
 
   if (!llmResult) {
@@ -776,7 +748,6 @@ async function handleIncomingMessage(
   if (llmResult.intent !== "handoff") {
     resetFailedAttempts(state);
   }
-  updateProfile(state, llmResult.customerName, llmResult.customerEmail);
   updateDelivery(state, llmResult.deliveryType, llmResult.deliveryAddress);
   recordBotMessage(state, llmResult.replyText);
   await saveState(phoneNumberId, from, state);
@@ -784,9 +755,13 @@ async function handleIncomingMessage(
   const profile = state.profile;
 
   if (llmResult.intent === "order") {
-    if (!profile.customerId || !profile.name || !profile.email) {
-      const identified = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials, true);
-      if (!identified) return;
+    await resolveCustomer(phoneNumberId, from, state);
+    if (!state.profile.name) {
+      // Falta el nombre: se guarda el pedido y se pide el nombre (solo eso).
+      state.pendingOrder = { kind: "order", items: llmResult.items, deliveryType: state.deliveryType, deliveryAddress: state.deliveryAddress };
+      state.stage = "ASK_CUSTOMER_NAME";
+      await replyAndStore(phoneNumberId, from, state, "Antes de registrar tu pedido, dime tu nombre completo por favor.", conv, credentials);
+      return;
     }
     await handleOrderIntent(phoneNumberId, from, state.profile.customerId, state.profile.name, state.profile.email,
       llmResult.items, menu, state.deliveryType, state.deliveryAddress, conv, credentials);
@@ -794,9 +769,12 @@ async function handleIncomingMessage(
   }
 
   if (llmResult.intent === "card_payment") {
-    if (!profile.customerId || !profile.name || !profile.email) {
-      const identified = await ensureCustomerIdentified(phoneNumberId, from, incoming, state, conv, credentials, true);
-      if (!identified) return;
+    await resolveCustomer(phoneNumberId, from, state);
+    if (!state.profile.name) {
+      state.pendingOrder = { kind: "card", items: llmResult.items, deliveryType: state.deliveryType, deliveryAddress: state.deliveryAddress };
+      state.stage = "ASK_CUSTOMER_NAME";
+      await replyAndStore(phoneNumberId, from, state, "Antes de tu pago, dime tu nombre completo por favor.", conv, credentials);
+      return;
     }
     await handleCardPaymentIntent(phoneNumberId, from, state.profile.name, state.profile.email,
       llmResult.items, state.deliveryType, state.deliveryAddress, conv, credentials);
@@ -828,10 +806,10 @@ async function handleOrderIntent(
   conv: ConvInfo | null = null,
   credentials?: RuntimeWhatsAppCredentials | null,
 ): Promise<void> {
-  if (!customerId || !customerName || !customerEmail) {
-    const replyText = "Antes de registrar tu pedido necesito completar tus datos de cliente.";
+  if (!customerId || !customerName) {
+    const replyText = "Antes de registrar tu pedido necesito tu nombre completo, por favor.";
     const state = await getState(phoneNumberId, from);
-    state.stage = !customerName ? "ASK_CUSTOMER_NAME" : "ASK_CUSTOMER_EMAIL";
+    state.stage = "ASK_CUSTOMER_NAME";
     recordBotMessage(state, replyText);
     await saveState(phoneNumberId, from, state);
     await safeReply(phoneNumberId, from, replyText, credentials);
